@@ -74,21 +74,28 @@ function isValidWorldId(worldId) {
     );
 }
 
+
 function leaveWorld(socket) {
     const worldId = socket.data.worldId;
+    const userId = socket.data.user?.id;
 
-    if (!worldId) {
+    if (!worldId || !userId) {
         return;
     }
 
     const world = worlds.get(worldId);
 
     if (world) {
-        world.delete(socket.id);
+        const player = world.get(userId);
 
-        socket.to(worldId).emit("player:left", {
-            id: socket.id
-        });
+        // Só a conexão responsável pode remover o jogador.
+        if (player?.socketId === socket.id) {
+            world.delete(userId);
+
+            socket.to(worldId).emit("player:left", {
+                id: userId
+            });
+        }
 
         if (world.size === 0) {
             worlds.delete(worldId);
@@ -98,6 +105,7 @@ function leaveWorld(socket) {
     socket.leave(worldId);
     socket.data.worldId = null;
 }
+
 
 function gerarToken(usuario) {
     return jwt.sign(
@@ -272,152 +280,248 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 // Conexões
+
+io.use(async (socket, next) => {
+    const token = socket.handshake.auth?.token;
+
+    if (!token) {
+        return next(new Error("AUTH_REQUIRED"));
+    }
+
+    try {
+        const payload = jwt.verify(token, JWT_SECRET);
+
+        if (!payload.sub) {
+            return next(new Error("INVALID_TOKEN"));
+        }
+
+        // Confirma que a conta ainda existe no banco.
+        const resultado = await pool.query(
+            `SELECT id, username
+             FROM users
+             WHERE id = $1
+             LIMIT 1`,
+            [payload.sub]
+        );
+
+        const usuario = resultado.rows[0];
+
+        if (!usuario) {
+            return next(new Error("INVALID_TOKEN"));
+        }
+
+        // Identidade autenticada da conexão.
+        socket.data.user = {
+            id: usuario.id,
+            username: usuario.username
+        };
+
+        next();
+
+    } catch (error) {
+        if (
+            error.name === "JsonWebTokenError" ||
+            error.name === "TokenExpiredError"
+        ) {
+            return next(new Error("INVALID_TOKEN"));
+        }
+
+        console.error(
+            "Erro ao autenticar conexão:",
+            error
+        );
+
+        next(new Error("AUTH_UNAVAILABLE"));
+    }
+});
+
+function publicPlayer(player) {
+    const { socketId, ...publicData } = player;
+
+    return publicData;
+}
+
 io.on("connection", (socket) => {
+
     console.log(`Jogador conectado: ${socket.id}`);
 
     socket.data.worldId = null;
     socket.data.lastMovement = 0;
 
     // Entrada em um mundo
-    socket.on("world:join", (data, callback) => {
-        const respond = typeof callback === "function"
-            ? callback
-            : () => {};
 
-        const worldId = data?.worldId;
-        const playerName = sanitizeName(data?.name);
+socket.on("world:join", (data, callback) => {
+    const respond = typeof callback === "function"
+        ? callback
+        : () => {};
 
-        if (!isValidWorldId(worldId)) {
-            return respond({
-                success: false,
-                message: "Identificador de mundo inválido."
-            });
-        }
+    const worldId = data?.worldId;
 
-        // Evita entrar duas vezes na mesma sala.
-        if (socket.data.worldId === worldId) {
-            return respond({
-                success: true,
-                message: "Você já está neste mundo."
-            });
-        }
+    const userId = socket.data.user.id;
+    const playerName = sanitizeName(
+        socket.data.user.username
+    );
 
-        // Sai do mundo anterior, caso exista.
-        leaveWorld(socket);
-
-        const world = getWorld(worldId);
-
-        if (world.size >= MAX_PLAYERS_PER_WORLD) {
-            if (world.size === 0) {
-                worlds.delete(worldId);
-            }
-
-            return respond({
-                success: false,
-                message: "Este mundo já atingiu o limite de 16 jogadores."
-            });
-        }
-
-        const player = {
-            id: socket.id,
-            name: playerName,
-            position: {
-                x: 0,
-                y: 0,
-                z: 0
-            },
-            rotation: {
-                yaw: 0,
-                pitch: 0
-            }
-        };
-
-        world.set(socket.id, player);
-
-        socket.join(worldId);
-        socket.data.worldId = worldId;
-
-        // Envia os jogadores que já estavam no mundo.
-        respond({
-            success: true,
-            worldId,
-            players: Array.from(world.values()).filter(
-                other => other.id !== socket.id
-            )
+    if (!isValidWorldId(worldId)) {
+        return respond({
+            success: false,
+            message: "Identificador de mundo inválido."
         });
+    }
 
-        // Avisa os outros jogadores sobre a entrada.
-        socket.to(worldId).emit("player:joined", player);
+    // Evita entrar duas vezes na mesma sala.
+    if (socket.data.worldId === worldId) {
+        return respond({
+            success: true,
+            message: "Você já está neste mundo."
+        });
+    }
 
-        console.log(
-            `${playerName} entrou no mundo ${worldId} (${world.size}/${MAX_PLAYERS_PER_WORLD})`
-        );
+    // Sai da sala anterior.
+    leaveWorld(socket);
+
+    const world = getWorld(worldId);
+
+    // Impede duas conexões da mesma conta na mesma sala.
+    if (world.has(userId)) {
+        return respond({
+            success: false,
+            message: "Esta conta já está conectada neste mundo."
+        });
+    }
+
+    if (world.size >= MAX_PLAYERS_PER_WORLD) {
+        if (world.size === 0) {
+            worlds.delete(worldId);
+        }
+
+        return respond({
+            success: false,
+            message: "Este mundo já atingiu o limite de 16 jogadores."
+        });
+    }
+
+    const player = {
+        id: userId,
+        name: playerName,
+
+        // Identificação interna da conexão.
+        socketId: socket.id,
+
+        position: {
+            x: 0,
+            y: 0,
+            z: 0
+        },
+
+        rotation: {
+            yaw: 0,
+            pitch: 0
+        }
+    };
+
+    // Armazena usando o UUID permanente.
+    world.set(userId, player);
+
+    socket.join(worldId);
+    socket.data.worldId = worldId;
+
+    // Envia os jogadores existentes.
+    respond({
+        success: true,
+        worldId,
+
+        players: Array.from(world.values())
+            .filter(other => other.id !== userId)
+            .map(publicPlayer)
     });
+
+    // Avisa os outros jogadores.
+    socket.to(worldId).emit(
+        "player:joined",
+        publicPlayer(player)
+    );
+
+    console.log(
+        `${playerName} (${userId}) entrou no mundo ${worldId} ` +
+        `(${world.size}/${MAX_PLAYERS_PER_WORLD})`
+    );
+});
+
 
     // Atualização da posição do jogador
-    socket.on("player:move", (data) => {
-        const worldId = socket.data.worldId;
 
-        if (!worldId) {
-            return;
-        }
+socket.on("player:move", (data) => {
+    const worldId = socket.data.worldId;
+    const userId = socket.data.user.id;
 
-        const world = worlds.get(worldId);
-        const player = world?.get(socket.id);
+    if (!worldId) {
+        return;
+    }
 
-        if (!player || !data) {
-            return;
-        }
+    const world = worlds.get(worldId);
+    const player = world?.get(userId);
 
-        // Limita a frequência das atualizações.
-        const now = Date.now();
+    if (
+        !player ||
+        player.socketId !== socket.id ||
+        !data
+    ) {
+        return;
+    }
 
-        if (now - socket.data.lastMovement < 50) {
-            return;
-        }
+    // Limita a frequência das atualizações.
+    const now = Date.now();
 
-        socket.data.lastMovement = now;
+    if (now - socket.data.lastMovement < 50) {
+        return;
+    }
 
-        const position = data.position;
-        const rotation = data.rotation;
+    socket.data.lastMovement = now;
 
-        if (
-            !position ||
-            !rotation ||
-            !Number.isFinite(position.x) ||
-            !Number.isFinite(position.y) ||
-            !Number.isFinite(position.z) ||
-            !Number.isFinite(rotation.yaw) ||
-            !Number.isFinite(rotation.pitch)
-        ) {
-            return;
-        }
+    const position = data.position;
+    const rotation = data.rotation;
 
-        // Limites básicos para evitar valores absurdos.
-        const coordinates = [position.x, position.y, position.z];
+    if (
+        !position ||
+        !rotation ||
+        !Number.isFinite(position.x) ||
+        !Number.isFinite(position.y) ||
+        !Number.isFinite(position.z) ||
+        !Number.isFinite(rotation.yaw) ||
+        !Number.isFinite(rotation.pitch)
+    ) {
+        return;
+    }
 
-        if (coordinates.some(value => Math.abs(value) > 100000)) {
-            return;
-        }
+    const coordinates = [
+        position.x,
+        position.y,
+        position.z
+    ];
 
-        player.position = {
-            x: position.x,
-            y: position.y,
-            z: position.z
-        };
+    if (coordinates.some(value => Math.abs(value) > 100000)) {
+        return;
+    }
 
-        player.rotation = {
-            yaw: rotation.yaw,
-            pitch: rotation.pitch
-        };
+    player.position = {
+        x: position.x,
+        y: position.y,
+        z: position.z
+    };
 
-        // Envia a atualização aos outros jogadores da mesma sala.
-        socket.to(worldId).emit("player:moved", {
-            id: socket.id,
-            position: player.position,
-            rotation: player.rotation
-        });
+    player.rotation = {
+        yaw: rotation.yaw,
+        pitch: rotation.pitch
+    };
+
+    socket.to(worldId).emit("player:moved", {
+        id: userId,
+        position: player.position,
+        rotation: player.rotation
     });
+});
+
 
     // Saída manual de um mundo
     socket.on("world:leave", () => {

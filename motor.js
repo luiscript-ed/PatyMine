@@ -27005,41 +27005,242 @@ class kg {
             ...e
         }, "Ver como foi criado ↗"))
     }
+
+    showAccount(mode = "login", notice = "") {
+        const currentUser = this.hooks.getCurrentUser?.();
+
+        // Conta já autenticada
+        if (currentUser) {
+            this.show(
+                "account",
+
+                j("div", {
+                    class: "panel-title"
+                }, "Minha Conta"),
+
+                j("p", {
+                    class: "dialog-text"
+                }, `Conectado como ${currentUser.username}`),
+
+                j("p", {
+                    class: "dialog-text"
+                }, currentUser.email),
+
+                re("Sair da conta", () => {
+                    this.hooks.logout();
+                    this.showMainMenu();
+                }, {
+                    wide: true
+                }),
+
+                re("Voltar ao menu", () => this.showMainMenu(), {
+                    wide: true
+                })
+            );
+
+            return;
+        }
+
+        const registering = mode === "register";
+
+        const usernameInput = j("input", {
+            class: "mc-input",
+            type: "text",
+            placeholder: "Nome de usuário",
+            maxlength: "20",
+            autocomplete: "username"
+        });
+
+        const emailInput = j("input", {
+            class: "mc-input",
+            type: "email",
+            placeholder: "E-mail",
+            autocomplete: "email"
+        });
+
+        const passwordInput = j("input", {
+            class: "mc-input",
+            type: "password",
+            placeholder: "Senha",
+            autocomplete: registering ? "new-password" : "current-password"
+        });
+
+        const feedback = j("p", {
+            class: "dialog-text"
+        }, notice);
+
+        const submit = re(
+            registering ? "Criar conta" : "Entrar",
+            async () => {
+                const credentials = {
+                    username: usernameInput.value.trim(),
+                    email: emailInput.value.trim(),
+                    password: passwordInput.value
+                };
+
+                if (!credentials.email || !credentials.password) {
+                    feedback.textContent = "Preencha o e-mail e a senha.";
+                    return;
+                }
+
+                if (registering && !credentials.username) {
+                    feedback.textContent = "Informe um nome de usuário.";
+                    return;
+                }
+
+                submit.disabled = true;
+                feedback.textContent = "Processando...";
+
+                try {
+                    const result = await this.hooks.authenticate(
+                        mode,
+                        credentials
+                    );
+
+                    if (!result.success) {
+                        throw new Error(result.message);
+                    }
+
+                    this.showMainMenu();
+
+                    this.hooks.onAccountAuthenticated?.();
+
+                } catch (error) {
+                    feedback.textContent =
+                        error.message || "Não foi possível autenticar.";
+
+                    submit.disabled = false;
+                }
+            },
+            {
+                wide: true
+            }
+        );
+
+        const toggle = re(
+            registering ? "Já possui uma conta? Entrar" : "Criar uma conta",
+            () => this.showAccount(
+                registering ? "login" : "register"
+            ),
+            {
+                wide: true
+            }
+        );
+
+        const back = re(
+            "Voltar ao menu",
+            () => {
+                this.hooks.cancelAccountFlow?.();
+                this.showMainMenu();
+            },
+            {
+                wide: true
+            }
+        );
+
+        this.show(
+            "account",
+
+            j("div", {
+                class: "panel-title"
+            }, registering ? "Criar Conta" : "Entrar"),
+
+            j("p", {
+                class: "dialog-text"
+            }, registering
+                ? "Crie sua conta no PatyCraft."
+                : "Entre para acessar o multiplayer."
+            ),
+
+            j("div", {
+                class: "form"
+            },
+                ...(registering ? [
+                    j("label", {}, "Nome de usuário"),
+                    usernameInput
+                ] : []),
+
+                j("label", {}, "E-mail"),
+                emailInput,
+
+                j("label", {}, "Senha"),
+                passwordInput
+            ),
+
+            feedback,
+            submit,
+            toggle,
+            back
+        );
+    }
+
+    
     showMainMenu() {
         const t = pc[Math.floor(Math.random() * pc.length)];
-        this.show("menu", j("div", {
-            class: "title-wrap"
-        }, j("h1", {
-            class: "game-title"
-        }, j("span", {
-            class: "t1"
-        }, "MINECRAFT"), j("span", {
-            class: "t2"
-        }, "AI RECREATION")), j("div", {
-            class: "splash"
-        }, t)), j("div", {
-            class: "menu-buttons"
-        }, re("Um Jogador", () => this.showWorlds(), {
-            wide: !0
-        }), re("Multijogador", () => this.hooks.openMultiplayer(), {
-            wide: !0
-        }),
-        {
-            wide: !0,
-            disabled: !0,
-            title: "Multijogador não foi implementado"
-        }), j("div", {
-            class: "btn-pair"
-        }, re("Opções...", () => {
-            this.backTarget = "menu",
-            this.showOptions()
-        }
-        ), re("Sair", () => this.showQuit()))), this.experimentLinks(), j("div", {
-            class: "footer-left"
-        }, "BlockCraft AI Challenge 1.0"), j("div", {
-            class: "footer-right"
-        }, "Projeto de fã. Não afiliado à Mojang/Microsoft.")
+
+        this.show(
+            "menu",
+
+            j("div", {
+                class: "title-wrap"
+            },
+                j("h1", {
+                    class: "game-title"
+                },
+                    j("span", {
+                        class: "t1"
+                    }, "MINECRAFT"),
+
+                    j("span", {
+                        class: "t2"
+                    }, "AI RECREATION")
+                ),
+
+                j("div", {
+                    class: "splash"
+                }, t)
+            ),
+
+            j("div", {
+                class: "menu-buttons"
+            },
+                re("Um Jogador", () => this.showWorlds(), {
+                    wide: true
+                }),
+
+                re("Multijogador", () => this.hooks.openMultiplayer(), {
+                    wide: true
+                }),
+
+                re("Conta", () => this.hooks.openAccount(), {
+                    wide: true
+                })
+            ),
+
+            j("div", {
+                class: "btn-pair"
+            },
+                re("Opções...", () => {
+                    this.backTarget = "menu";
+                    this.showOptions();
+                }),
+
+                re("Sair", () => this.showQuit())
+            ),
+
+            this.experimentLinks(),
+
+            j("div", {
+                class: "footer-left"
+            }, "BlockCraft AI Challenge 1.0"),
+
+            j("div", {
+                class: "footer-right"
+            }, "Projeto de fã. Não afiliado à Mojang/Microsoft.")
+        );
     }
+
+
     showQuit() {
         window.close(),
         this.show("dialog", j("div", {
@@ -27434,7 +27635,7 @@ class kg {
 }
 const Cs = (i, t, e) => `${i},${t},${e}`
   , Bg = Number(new URLSearchParams(location.search).get("timeScale")) || 1;
-  const MULTIPLAYER_SERVER_URL = "http://localhost:3000";
+  const MULTIPLAYER_SERVER_URL = "https://patymine.onrender.com";
 class zg {
     constructor(t) {
         this.multiplayerWorldId = null;
@@ -27442,6 +27643,32 @@ class zg {
         this.multiplayerJoining = false;
         this.multiplayerMoveTimer = 0;
         this.remotePlayers = new Map();
+
+        this.multiplayerToken = sessionStorage.getItem("patycraft_token");
+        this.multiplayerUser = null;
+        this.multiplayerPendingAuth = false;
+
+        try {
+            const savedUser = sessionStorage.getItem("patycraft_user");
+
+            if (savedUser && this.multiplayerToken) {
+                this.multiplayerUser = JSON.parse(savedUser);
+            }
+
+            if (!this.multiplayerUser) {
+                this.multiplayerToken = null;
+                sessionStorage.removeItem("patycraft_token");
+                sessionStorage.removeItem("patycraft_user");
+            }
+        } catch (error) {
+            this.multiplayerToken = null;
+            this.multiplayerUser = null;
+
+            sessionStorage.removeItem("patycraft_token");
+            sessionStorage.removeItem("patycraft_user");
+        }
+
+
         this.canvas = t,
         this.scene = new Nl,
         this.handScene = new Nl,
@@ -27536,7 +27763,21 @@ class zg {
         this.input = new Mg(t);
         const r = {
             settings: this.settings,
-            openMultiplayer: () => this.connectMultiplayer(),
+            openMultiplayer: () => this.openMultiplayer(),
+            openAccount: () => this.openAccount(),
+            authenticate: (mode, credentials) =>
+                this.authenticateAccount(mode, credentials),
+            getCurrentUser: () => this.multiplayerUser,
+            logout: () => this.logoutAccount(),
+            cancelAccountFlow: () => {
+                this.multiplayerPendingAuth = false;
+            },
+            onAccountAuthenticated: () => {
+                if (this.multiplayerPendingAuth) {
+                    this.multiplayerPendingAuth = false;
+                    this.connectMultiplayer();
+                }
+            },
             applySettings: () => this.applySettings(),
             playWorld: o => this.playWorld(o),
             createWorld: o => this.createWorld(o),
@@ -27544,12 +27785,13 @@ class zg {
             saveAndQuit: () => this.saveAndQuit(),
             respawn: () => this.respawn(),
             setDifficulty: o => {
-                this.difficulty = o,
-                this.meta && (this.meta.difficulty = o)
-            }
-            ,
-            currentDifficulty: () => this.world ? this.difficulty : null
+                this.difficulty = o;
+                this.meta && (this.meta.difficulty = o);
+            },
+            currentDifficulty: () =>
+                this.world ? this.difficulty : null
         };
+
         this.ui = new kg(r,this.icons,{
             icons: this.icons,
             dropStack: o => this.dropStack(o),
@@ -27583,9 +27825,115 @@ class zg {
         this.applySettings(),
         this.mobCtx = this.makeMobCtx()
     }
+
+    async authenticateAccount(mode, credentials) {
+        try {
+            const endpoint = mode === "register"
+                ? "/api/auth/register"
+                : "/api/auth/login";
+
+            const response = await fetch(
+                MULTIPLAYER_SERVER_URL + endpoint,
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+
+                    body: JSON.stringify(credentials)
+                }
+            );
+
+            const data = await response.json();
+
+            if (
+                !response.ok ||
+                !data.success ||
+                !data.token ||
+                !data.user?.id
+            ) {
+                return {
+                    success: false,
+                    message: data.message || "Falha na autenticação."
+                };
+            }
+
+            this.multiplayerToken = data.token;
+            this.multiplayerUser = data.user;
+
+            sessionStorage.setItem(
+                "patycraft_token",
+                data.token
+            );
+
+            sessionStorage.setItem(
+                "patycraft_user",
+                JSON.stringify(data.user)
+            );
+
+            return {
+                success: true,
+                user: data.user
+            };
+
+        } catch (error) {
+            console.error("Erro na autenticação:", error);
+
+            return {
+                success: false,
+                message: "Não foi possível conectar ao servidor."
+            };
+        }
+    }
+
+    openAccount() {
+        this.ui.showAccount("login");
+    }
+
+    openMultiplayer() {
+        if (!this.multiplayerToken || !this.multiplayerUser) {
+            this.multiplayerPendingAuth = true;
+
+            this.ui.showAccount(
+                "login",
+                "Entre na sua conta para acessar o multiplayer."
+            );
+
+            return;
+        }
+
+        this.connectMultiplayer();
+    }
+
+    logoutAccount() {
+        if (this.multiplayerSocket) {
+            this.multiplayerSocket.disconnect();
+            this.multiplayerSocket = null;
+        }
+
+        this.multiplayerToken = null;
+        this.multiplayerUser = null;
+
+        this.multiplayerConnected = false;
+        this.multiplayerWorldId = null;
+        this.multiplayerJoining = false;
+        this.multiplayerPendingAuth = false;
+
+        sessionStorage.removeItem("patycraft_token");
+        sessionStorage.removeItem("patycraft_user");
+
+        this.clearRemotePlayers();
+    }
+
     connectMultiplayer() {
         if (!window.io) {
             alert("Socket.IO não foi carregado. Verifique o HTML.");
+            return;
+        }
+
+        if (!this.multiplayerToken || !this.multiplayerUser) {
+            this.openMultiplayer();
             return;
         }
 
@@ -27594,14 +27942,33 @@ class zg {
             return;
         }
 
-        this.multiplayerSocket = window.io(MULTIPLAYER_SERVER_URL, {
-            transports: ["websocket"]
-        });
+        // Evita manter uma conexão antiga.
+        this.multiplayerSocket?.disconnect();
+
+        this.multiplayerSocket = window.io(
+            MULTIPLAYER_SERVER_URL,
+            {
+                transports: ["websocket"],
+
+                auth: {
+                    token: this.multiplayerToken
+                }
+            }
+        );
 
         this.multiplayerSocket.on("connect", () => {
             this.multiplayerConnected = true;
 
-            console.log("Conectado ao servidor multiplayer:", this.multiplayerSocket.id);
+            console.log(
+                "Conectado ao servidor multiplayer:",
+                this.multiplayerSocket.id
+            );
+
+            console.log(
+                "Conta autenticada:",
+                this.multiplayerUser.username,
+                this.multiplayerUser.id
+            );
 
             if (this.state === "playing" && this.meta) {
                 this.joinMultiplayerWorld();
@@ -27611,15 +27978,52 @@ class zg {
         this.multiplayerSocket.on("connect_error", (error) => {
             this.multiplayerConnected = false;
 
-            console.error("Erro de conexão multiplayer:", error);
+            console.error(
+                "Erro de conexão multiplayer:",
+                error.message
+            );
 
-            alert("Não foi possível conectar ao servidor multiplayer.");
+            if (
+                error.message === "AUTH_REQUIRED" ||
+                error.message === "INVALID_TOKEN"
+            ) {
+                this.multiplayerSocket?.disconnect();
+                this.multiplayerSocket = null;
+
+                this.multiplayerToken = null;
+                this.multiplayerUser = null;
+
+                sessionStorage.removeItem("patycraft_token");
+                sessionStorage.removeItem("patycraft_user");
+
+                this.multiplayerPendingAuth = true;
+
+                this.ui.showAccount(
+                    "login",
+                    "Sua sessão expirou. Entre novamente."
+                );
+
+                return;
+            }
+
+            alert(
+                error.message === "AUTH_UNAVAILABLE"
+                    ? "Não foi possível verificar sua conta no servidor."
+                    : "Não foi possível conectar ao servidor multiplayer."
+            );
         });
 
         this.multiplayerSocket.on("disconnect", (reason) => {
             this.multiplayerConnected = false;
+            this.multiplayerWorldId = null;
+            this.multiplayerJoining = false;
 
-            console.log("Desconectado do multiplayer:", reason);
+            this.clearRemotePlayers();
+
+            console.log(
+                "Desconectado do multiplayer:",
+                reason
+            );
         });
 
         this.multiplayerSocket.on("player:joined", (player) => {
@@ -27633,68 +28037,81 @@ class zg {
         this.multiplayerSocket.on("player:left", (data) => {
             this.removeRemotePlayer(data?.id ?? data);
         });
-
     }
+
+
     joinMultiplayerWorld() {
-    if (
-        !this.multiplayerSocket?.connected ||
-        !this.meta ||
-        this.state !== "playing" ||
-        this.multiplayerWorldId ||
-        this.multiplayerJoining
-    ) {
-        return;
-    }
-
-    const roomId = window.prompt(
-        "Digite o código da sala multiplayer:",
-        this.multiplayerRoomCode || this.meta.id
-    );
-
-    if (!roomId || !roomId.trim()) {
-        return;
-    }
-
-    const playerName = window.prompt(
-        "Digite seu nome no multiplayer:",
-        "Jogador"
-    );
-
-    this.multiplayerRoomCode = roomId.trim();
-    this.multiplayerJoining = true;
-
-    this.multiplayerSocket.emit("world:join", {
-        worldId: this.multiplayerRoomCode,
-        name: (playerName || "Jogador").trim().slice(0, 20)
-    }, (response) => {
-
-        this.multiplayerJoining = false;
-
-        if (!response?.success) {
-            this.ui.toast("Não foi possível entrar na sala multiplayer.");
+        if (
+            !this.multiplayerSocket?.connected ||
+            !this.multiplayerUser ||
+            !this.meta ||
+            this.state !== "playing" ||
+            this.multiplayerWorldId ||
+            this.multiplayerJoining
+        ) {
             return;
         }
 
-        this.multiplayerWorldId = response.worldId;
+        const roomId = window.prompt(
+            "Digite o código da sala multiplayer:",
+            this.multiplayerRoomCode || this.meta.id
+        );
 
-        for (const player of response.players || []) {
-            this.updateRemotePlayer(player);
+        if (!roomId || !roomId.trim()) {
+            return;
         }
 
-        console.log("Sala multiplayer:", response.worldId);
+        this.multiplayerRoomCode = roomId.trim();
+        this.multiplayerJoining = true;
 
-        this.ui.toast("Multiplayer conectado!");
+        this.multiplayerSocket.emit(
+            "world:join",
+            {
+                worldId: this.multiplayerRoomCode
+            },
+            (response) => {
+                this.multiplayerJoining = false;
 
-        window.alert(
-            "Você entrou na sala multiplayer!\n\nCódigo da sala: " +
-            response.worldId
+                if (!response?.success) {
+                    this.ui.toast(
+                        response?.message ||
+                        "Não foi possível entrar na sala."
+                    );
+
+                    return;
+                }
+
+                this.multiplayerWorldId = response.worldId;
+
+                for (const player of response.players || []) {
+                    this.updateRemotePlayer(player);
+                }
+
+                console.log(
+                    "Sala multiplayer:",
+                    response.worldId
+                );
+
+                this.ui.toast("Multiplayer conectado!");
+
+                window.alert(
+                    "Você entrou na sala multiplayer!\n\n" +
+                    "Código da sala: " +
+                    response.worldId
+                );
+            }
         );
-    });
     }
+
+
     updateRemotePlayer(data) {
     const player = data?.player ?? data;
 
-    if (!player || !player.id || player.id === this.multiplayerSocket?.id) {
+    if (
+        !player ||
+        !player.id ||
+        player.id === this.multiplayerUser?.id
+    ) {
         return;
     }
 
