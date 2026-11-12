@@ -1,12 +1,40 @@
+require("dotenv").config();
+
 const http = require("http");
+const { randomUUID } = require("crypto");
+
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+
 const { Server } = require("socket.io");
 const { pool, testarBanco } = require("./db");
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS_PER_WORLD = 16;
 
-// Servidor HTTP
-const httpServer = http.createServer();
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+    throw new Error("JWT_SECRET não foi configurada.");
+}
+
+// Aplicação HTTP
+const app = express();
+
+app.use(cors({
+    origin: true,
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"]
+}));
+
+app.use(express.json({
+    limit: "10kb"
+}));
+
+// Servidor HTTP compartilhado com Socket.IO
+const httpServer = http.createServer(app);
 
 // Socket.IO
 const io = new Server(httpServer, {
@@ -70,6 +98,178 @@ function leaveWorld(socket) {
     socket.leave(worldId);
     socket.data.worldId = null;
 }
+
+function gerarToken(usuario) {
+    return jwt.sign(
+        {
+            username: usuario.username
+        },
+        JWT_SECRET,
+        {
+            subject: usuario.id,
+            expiresIn: "7d"
+        }
+    );
+}
+
+app.post("/api/auth/register", async (req, res) => {
+    const username = typeof req.body?.username === "string"
+        ? req.body.username.trim()
+        : "";
+
+    const email = typeof req.body?.email === "string"
+        ? req.body.email.trim().toLowerCase()
+        : "";
+
+    const password = typeof req.body?.password === "string"
+        ? req.body.password
+        : "";
+
+    // Validações
+    if (username.length < 3 || username.length > 20) {
+        return res.status(400).json({
+            success: false,
+            message: "O nome deve possuir entre 3 e 20 caracteres."
+        });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({
+            success: false,
+            message: "E-mail inválido."
+        });
+    }
+
+    if (
+        password.length < 8 ||
+        Buffer.byteLength(password, "utf8") > 72
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "A senha deve possuir entre 8 e 72 bytes."
+        });
+    }
+
+    try {
+        // Protege a senha
+        const passwordHash = await bcrypt.hash(password, 12);
+
+        // Cria a conta
+        const resultado = await pool.query(
+            `INSERT INTO users
+            (id, username, email, password_hash)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, username, email`,
+            [
+                randomUUID(),
+                username,
+                email,
+                passwordHash
+            ]
+        );
+
+        const usuario = resultado.rows[0];
+
+        // Gera o token
+        const token = gerarToken(usuario);
+
+        return res.status(201).json({
+            success: true,
+            message: "Conta criada com sucesso.",
+            token,
+            user: usuario
+        });
+
+    } catch (error) {
+        if (error.code === "23505") {
+            return res.status(409).json({
+                success: false,
+                message: "Este e-mail já está cadastrado."
+            });
+        }
+
+        console.error("Erro no cadastro:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Erro interno ao criar a conta."
+        });
+    }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+    const email = typeof req.body?.email === "string"
+        ? req.body.email.trim().toLowerCase()
+        : "";
+
+    const password = typeof req.body?.password === "string"
+        ? req.body.password
+        : "";
+
+    if (!email || !password) {
+        return res.status(400).json({
+            success: false,
+            message: "Informe o e-mail e a senha."
+        });
+    }
+
+    try {
+        // Busca a conta
+        const resultado = await pool.query(
+            `SELECT id, username, email, password_hash
+             FROM users
+             WHERE email = $1
+             LIMIT 1`,
+            [email]
+        );
+
+        const usuario = resultado.rows[0];
+
+        if (!usuario || !usuario.password_hash) {
+            return res.status(401).json({
+                success: false,
+                message: "E-mail ou senha incorretos."
+            });
+        }
+
+        // Verifica a senha
+        const senhaValida = await bcrypt.compare(
+            password,
+            usuario.password_hash
+        );
+
+        if (!senhaValida) {
+            return res.status(401).json({
+                success: false,
+                message: "E-mail ou senha incorretos."
+            });
+        }
+
+        // Remove o hash da resposta
+        const user = {
+            id: usuario.id,
+            username: usuario.username,
+            email: usuario.email
+        };
+
+        const token = gerarToken(user);
+
+        return res.json({
+            success: true,
+            message: "Login realizado com sucesso.",
+            token,
+            user
+        });
+
+    } catch (error) {
+        console.error("Erro no login:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Erro interno ao realizar login."
+        });
+    }
+});
 
 // Conexões
 io.on("connection", (socket) => {
