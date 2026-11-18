@@ -26998,12 +26998,12 @@ class kg {
             class: "experiment-links",
             "aria-label": "Sobre este experimento"
         }, j("a", {
-            href: "/experimentos/minecraft-com-ia/",
+            href: "https://www.minecraft.net/pt-br",
             ...e
-        }, "Comparar as versões ↗"), j("a", {
-            href: "/experimentos/minecraft-com-ia/#video",
+        }, "Minecraft ↗"), j("a", {
+            href: "https://github.com/luiscript-ed/PatyMine",
             ...e
-        }, "Ver como foi criado ↗"))
+        }, "Ver Repositorio ↗"))
     }
 
     showAccount(mode = "login", notice = "") {
@@ -27079,17 +27079,17 @@ class kg {
                 };
 
                 if (!credentials.email || !credentials.password) {
-                    feedback.textContent = "Preencha o e-mail e a senha.";
+                    feedback.textContent = "Preencha o E-mail e a Senha.";
                     return;
                 }
 
                 if (registering && !credentials.username) {
-                    feedback.textContent = "Informe um nome de usuário.";
+                    feedback.textContent = "Coloque um Nome de Usuario";
                     return;
                 }
 
                 submit.disabled = true;
-                feedback.textContent = "Processando...";
+                feedback.textContent = "Carregando...";
 
                 try {
                     const result = await this.hooks.authenticate(
@@ -27107,7 +27107,7 @@ class kg {
 
                 } catch (error) {
                     feedback.textContent =
-                        error.message || "Não foi possível autenticar.";
+                        error.message || "Paty Desconhecida (erro de autentificação).";
 
                     submit.disabled = false;
                 }
@@ -27189,11 +27189,11 @@ class kg {
                 },
                     j("span", {
                         class: "t1"
-                    }, "MINECRAFT"),
+                    }, "PATYCRAFT"),
 
                     j("span", {
                         class: "t2"
-                    }, "AI RECREATION")
+                    }, "BX-Baiano RECREATION")
                 ),
 
                 j("div", {
@@ -27204,11 +27204,11 @@ class kg {
             j("div", {
                 class: "menu-buttons"
             },
-                re("Um Jogador", () => this.showWorlds(), {
+                re("Jogar", () => this.showWorlds(), {
                     wide: true
                 }),
 
-                re("Multijogador", () => this.hooks.openMultiplayer(), {
+                re("Verficar Conexão", () => this.hooks.openMultiplayer(), {
                     wide: true
                 }),
 
@@ -27232,11 +27232,11 @@ class kg {
 
             j("div", {
                 class: "footer-left"
-            }, "BlockCraft AI Challenge 1.0"),
+            }, "PatyMine Versão 1.1.2"),
 
             j("div", {
                 class: "footer-right"
-            }, "Projeto de fã. Não afiliado à Mojang/Microsoft.")
+            }, "Projeto Colegas. Não afiliado à Mojang/Microsoft.")
         );
     }
 
