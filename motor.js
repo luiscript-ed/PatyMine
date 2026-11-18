@@ -26900,7 +26900,7 @@ function Fg(i) {
     } catch {}
 }
 const Ps = ["Pacífico", "Fácil", "Normal", "Difícil"]
-  , pc = ["Feito por IA!", "Agora com creepers!", "100% procedural!", "Também experimente terra!", "Sem chaves de API!", "Blocos infinitos!", "Cuidado à noite!", "Pixelado com amor!", "Voxels!"];
+  , pc = ["Feito por IA!", "Agora com Patricias!", "100% patricial!", "Quem é essse breninho?", "Nenel ama dinossauros", "Luiz sai de casa", "Cuidado com a Selma!", "Fuja do Jack!", "PatyBL passou aqui", "Já pisou na grama hoje?", "Beba Agua", "Esse que é seu Namorado amiga?", "Olha o Mickey ali!", "Experimente tambem terraria!"];
 class kg {
     constructor(t, e, n) {
         this.hooks = t,
@@ -30064,5 +30064,5 @@ try {
     i.start()
 } catch (i) {
     console.error(i),
-    document.getElementById("ui").innerHTML = `<div class="fatal">Não foi possível iniciar o jogo (WebGL necessário).<br>${String(i)}</div>`
+    document.getElementById("ui").innerHTML = `<div class="fatal">Patricia não pode resenhar (WebGL necessário).<br>${String(i)}</div>`
 }
