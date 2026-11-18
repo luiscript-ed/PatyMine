@@ -66,12 +66,12 @@ function sanitizeName(name) {
 }
 
 function isValidWorldId(worldId) {
+
     return (
         typeof worldId === "string" &&
-        worldId.length > 0 &&
-        worldId.length <= 100 &&
-        /^[a-zA-Z0-9_-]+$/.test(worldId)
+        UUID_REGEX.test(worldId)
     );
+
 }
 
 
@@ -335,6 +335,69 @@ io.use(async (socket, next) => {
     }
 });
 
+const UUID_REGEX =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+
+// Obtém a identidade validada pelo middleware JWT.
+// Nunca utiliza um user_id enviado pelo cliente.
+function getAuthenticatedUserId(socket) {
+    const authenticatedUser =
+        socket.data?.user ??
+        socket.user ??
+        socket.data?.account ??
+        {};
+
+    const userId =
+        authenticatedUser.id ??
+        authenticatedUser.userId ??
+        authenticatedUser.sub ??
+        socket.data?.userId ??
+        socket.userId;
+
+    if (
+        typeof userId !== "string" ||
+        !UUID_REGEX.test(userId)
+    ) {
+        throw new Error("AUTH_REQUIRED");
+    }
+
+    return userId;
+}
+
+
+// Retorna erros sem expor detalhes internos do PostgreSQL.
+function sendSocketError(ack, error, fallbackMessage) {
+    console.error("Erro em evento de mundo:", error);
+
+    if (typeof ack === "function") {
+        ack({
+            success: false,
+            message: error.publicMessage || fallbackMessage
+        });
+    }
+}
+
+
+// Cria um erro de validação que pode ser retornado ao cliente.
+function createRequestError(message) {
+    const error = new Error(message);
+
+    error.publicMessage = message;
+
+    return error;
+}
+
+
+// Verifica se um valor é um objeto JSON válido.
+function isPlainObject(value) {
+    return (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value)
+    );
+}
+
 function publicPlayer(player) {
     const { socketId, ...publicData } = player;
 
@@ -350,182 +413,701 @@ io.on("connection", (socket) => {
 
     // Entrada em um mundo
 
-socket.on("world:join", (data, callback) => {
-    const respond = typeof callback === "function"
-        ? callback
-        : () => {};
 
-    const worldId = data?.worldId;
+    socket.on("world:join", async (data = {}, ack) => {
 
-    const userId = socket.data.user.id;
-    const playerName = sanitizeName(
-        socket.data.user.username
-    );
+        try {
 
-    if (!isValidWorldId(worldId)) {
-        return respond({
-            success: false,
-            message: "Identificador de mundo inválido."
-        });
-    }
+            const userId = getAuthenticatedUserId(socket);
 
-    // Evita entrar duas vezes na mesma sala.
-    if (socket.data.worldId === worldId) {
-        return respond({
-            success: true,
-            message: "Você já está neste mundo."
-        });
-    }
+            const worldId = data?.worldId;
 
-    // Sai da sala anterior.
-    leaveWorld(socket);
+            const playerName = sanitizeName(
+                socket.data.user.username
+            );
 
-    const world = getWorld(worldId);
 
-    // Impede duas conexões da mesma conta na mesma sala.
-    if (world.has(userId)) {
-        return respond({
-            success: false,
-            message: "Esta conta já está conectada neste mundo."
-        });
-    }
+            // 1. Valida o UUID do mundo.
 
-    if (world.size >= MAX_PLAYERS_PER_WORLD) {
-        if (world.size === 0) {
-            worlds.delete(worldId);
+            if (!isValidWorldId(worldId)) {
+                throw createRequestError(
+                    "Identificador de mundo inválido."
+                );
+            }
+
+
+            // 2. Verifica a existência do mundo e as permissões.
+
+            const accessResult = await pool.query(
+                `
+                SELECT
+                    w.id,
+                    w.owner_id,
+                    w.visibility,
+                    w.max_players
+
+                FROM worlds w
+
+                WHERE
+                    w.id = $1
+
+                    AND (
+                        w.owner_id = $2
+
+                        OR w.visibility = 'public'
+
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+
+                LIMIT 1
+                `,
+                [worldId, userId]
+            );
+
+
+            if (accessResult.rows.length === 0) {
+                throw createRequestError(
+                    "Mundo não encontrado ou você não possui acesso."
+                );
+            }
+
+
+            const worldRecord = accessResult.rows[0];
+
+
+            // 3. Evita entrar duas vezes na mesma sala.
+
+            if (socket.data.worldId === worldId) {
+
+                const currentWorld = worlds.get(worldId);
+
+                const currentPlayer = currentWorld?.get(userId);
+
+                if (currentPlayer?.socketId === socket.id) {
+
+                    if (typeof ack === "function") {
+                        ack({
+                            success: true,
+                            worldId,
+
+                            players: Array.from(currentWorld.values())
+                                .filter(other => other.id !== userId)
+                                .map(publicPlayer)
+                        });
+                    }
+
+                    return;
+                }
+            }
+
+
+            // 4. Verifica se outra conexão da mesma conta
+            // já está presente no mundo.
+
+            const existingWorld = worlds.get(worldId);
+
+            if (existingWorld?.has(userId)) {
+                throw createRequestError(
+                    "Esta conta já está conectada neste mundo."
+                );
+            }
+
+
+            // 5. Determina o limite de jogadores.
+            // O banco pode estabelecer um limite menor,
+            // mas nunca ultrapassaremos 16 jogadores.
+
+            const configuredLimit = Number(
+                worldRecord.max_players
+            );
+
+            const worldLimit =
+                Number.isInteger(configuredLimit) &&
+                configuredLimit > 0
+
+                    ? Math.min(
+                        configuredLimit,
+                        MAX_PLAYERS_PER_WORLD
+                    )
+
+                    : MAX_PLAYERS_PER_WORLD;
+
+
+            if ((existingWorld?.size ?? 0) >= worldLimit) {
+                throw createRequestError(
+                    `Este mundo já atingiu o limite de ${worldLimit} jogadores.`
+                );
+            }
+
+
+            // 6. Somente agora sai da sala anterior.
+            // Assim, uma tentativa de entrada inválida
+            // não desconecta o jogador do mundo atual.
+
+            leaveWorld(socket);
+
+
+            // 7. Recupera ou cria a estrutura em memória.
+
+            const world = getWorld(worldId);
+
+
+            // 8. Cria a representação do jogador.
+
+            const player = {
+
+                id: userId,
+
+                name: playerName,
+
+                // Identificação interna da conexão.
+                socketId: socket.id,
+
+                position: {
+                    x: 0,
+                    y: 0,
+                    z: 0
+                },
+
+                rotation: {
+                    yaw: 0,
+                    pitch: 0
+                }
+
+            };
+
+
+            // 9. Registra o jogador pelo UUID permanente.
+
+            world.set(userId, player);
+
+
+            // 10. Coloca a conexão na sala.
+
+            socket.join(worldId);
+
+            socket.data.worldId = worldId;
+
+
+            // 11. Retorna os jogadores que já estavam na sala.
+
+            if (typeof ack === "function") {
+                ack({
+
+                    success: true,
+
+                    worldId,
+
+                    players: Array.from(world.values())
+                        .filter(other => other.id !== userId)
+                        .map(publicPlayer)
+
+                });
+            }
+
+
+            // 12. Notifica os demais participantes.
+
+            socket.to(worldId).emit(
+                "player:joined",
+                publicPlayer(player)
+            );
+
+
+            console.log(
+                `${playerName} (${userId}) entrou no mundo ${worldId} ` +
+                `(${world.size}/${worldLimit})`
+            );
+
+
+        } catch (error) {
+
+            sendSocketError(
+                ack,
+                error,
+                "Não foi possível entrar neste mundo."
+            );
+
         }
 
-        return respond({
-            success: false,
-            message: "Este mundo já atingiu o limite de 16 jogadores."
-        });
-    }
-
-    const player = {
-        id: userId,
-        name: playerName,
-
-        // Identificação interna da conexão.
-        socketId: socket.id,
-
-        position: {
-            x: 0,
-            y: 0,
-            z: 0
-        },
-
-        rotation: {
-            yaw: 0,
-            pitch: 0
-        }
-    };
-
-    // Armazena usando o UUID permanente.
-    world.set(userId, player);
-
-    socket.join(worldId);
-    socket.data.worldId = worldId;
-
-    // Envia os jogadores existentes.
-    respond({
-        success: true,
-        worldId,
-
-        players: Array.from(world.values())
-            .filter(other => other.id !== userId)
-            .map(publicPlayer)
     });
-
-    // Avisa os outros jogadores.
-    socket.to(worldId).emit(
-        "player:joined",
-        publicPlayer(player)
-    );
-
-    console.log(
-        `${playerName} (${userId}) entrou no mundo ${worldId} ` +
-        `(${world.size}/${MAX_PLAYERS_PER_WORLD})`
-    );
-});
 
 
     // Atualização da posição do jogador
 
-socket.on("player:move", (data) => {
-    const worldId = socket.data.worldId;
-    const userId = socket.data.user.id;
+    socket.on("player:move", (data) => {
+        const worldId = socket.data.worldId;
+        const userId = socket.data.user.id;
 
-    if (!worldId) {
-        return;
-    }
+        if (!worldId) {
+            return;
+        }
 
-    const world = worlds.get(worldId);
-    const player = world?.get(userId);
+        const world = worlds.get(worldId);
+        const player = world?.get(userId);
 
-    if (
-        !player ||
-        player.socketId !== socket.id ||
-        !data
-    ) {
-        return;
-    }
+        if (
+            !player ||
+            player.socketId !== socket.id ||
+            !data
+        ) {
+            return;
+        }
 
-    // Limita a frequência das atualizações.
-    const now = Date.now();
+        // Limita a frequência das atualizações.
+        const now = Date.now();
 
-    if (now - socket.data.lastMovement < 50) {
-        return;
-    }
+        if (now - socket.data.lastMovement < 50) {
+            return;
+        }
 
-    socket.data.lastMovement = now;
+        socket.data.lastMovement = now;
 
-    const position = data.position;
-    const rotation = data.rotation;
+        const position = data.position;
+        const rotation = data.rotation;
 
-    if (
-        !position ||
-        !rotation ||
-        !Number.isFinite(position.x) ||
-        !Number.isFinite(position.y) ||
-        !Number.isFinite(position.z) ||
-        !Number.isFinite(rotation.yaw) ||
-        !Number.isFinite(rotation.pitch)
-    ) {
-        return;
-    }
+        if (
+            !position ||
+            !rotation ||
+            !Number.isFinite(position.x) ||
+            !Number.isFinite(position.y) ||
+            !Number.isFinite(position.z) ||
+            !Number.isFinite(rotation.yaw) ||
+            !Number.isFinite(rotation.pitch)
+        ) {
+            return;
+        }
 
-    const coordinates = [
-        position.x,
-        position.y,
-        position.z
-    ];
+        const coordinates = [
+            position.x,
+            position.y,
+            position.z
+        ];
 
-    if (coordinates.some(value => Math.abs(value) > 100000)) {
-        return;
-    }
+        if (coordinates.some(value => Math.abs(value) > 100000)) {
+            return;
+        }
 
-    player.position = {
-        x: position.x,
-        y: position.y,
-        z: position.z
-    };
+        player.position = {
+            x: position.x,
+            y: position.y,
+            z: position.z
+        };
 
-    player.rotation = {
-        yaw: rotation.yaw,
-        pitch: rotation.pitch
-    };
+        player.rotation = {
+            yaw: rotation.yaw,
+            pitch: rotation.pitch
+        };
 
-    socket.to(worldId).emit("player:moved", {
-        id: userId,
-        position: player.position,
-        rotation: player.rotation
+        socket.to(worldId).emit("player:moved", {
+            id: userId,
+            position: player.position,
+            rotation: player.rotation
+        });
     });
-});
-
 
     // Saída manual de um mundo
     socket.on("world:leave", () => {
         leaveWorld(socket);
+    });
+
+    socket.on("world:create", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            const ownerId = getAuthenticatedUserId(socket);
+
+            if (!isPlainObject(payload)) {
+                throw createRequestError("Dados do mundo inválidos.");
+            }
+
+            const name = String(payload.name ?? "").trim();
+            const description = String(payload.description ?? "").trim();
+            const seed = String(payload.seed ?? "").trim();
+            const visibility = payload.visibility ?? "private";
+            const settings = payload.settings ?? {};
+
+            if (!name || name.length > 32) {
+                throw createRequestError(
+                    "O nome deve ter entre 1 e 32 caracteres."
+                );
+            }
+
+            if (description.length > 500) {
+                throw createRequestError(
+                    "A descrição deve ter no máximo 500 caracteres."
+                );
+            }
+
+            if (!seed || seed.length > 128) {
+                throw createRequestError("Seed inválida.");
+            }
+
+            if (!["private", "public"].includes(visibility)) {
+                throw createRequestError("Visibilidade inválida.");
+            }
+
+            if (!isPlainObject(settings)) {
+                throw createRequestError(
+                    "As configurações do mundo são inválidas."
+                );
+            }
+
+            const settingsJson = JSON.stringify(settings);
+
+            if (Buffer.byteLength(settingsJson, "utf8") > 65536) {
+                throw createRequestError(
+                    "As configurações do mundo são muito grandes."
+                );
+            }
+
+            client = await pool.connect();
+
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            const result = await client.query(
+                `
+                INSERT INTO worlds (
+                    owner_id,
+                    name,
+                    description,
+                    visibility,
+                    seed,
+                    settings,
+                    max_players
+                )
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, 16)
+                RETURNING
+                    id,
+                    owner_id,
+                    name,
+                    description,
+                    visibility,
+                    seed,
+                    settings,
+                    max_players,
+                    created_at,
+                    updated_at
+                `,
+                [
+                    ownerId,
+                    name,
+                    description,
+                    visibility,
+                    seed,
+                    settingsJson
+                ]
+            );
+
+            const world = result.rows[0];
+
+            // Associa o criador ao mundo como proprietário.
+            await client.query(
+                `
+                INSERT INTO world_members (
+                    world_id,
+                    user_id,
+                    role
+                )
+                VALUES ($1, $2, 'owner')
+                `,
+                [world.id, ownerId]
+            );
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    world
+                });
+            }
+
+            console.log(
+                `Mundo criado: ${world.id} | Proprietário: ${ownerId}`
+            );
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error("Erro no rollback:", rollbackError);
+                }
+            }
+
+            sendSocketError(
+                ack,
+                error,
+                "Não foi possível criar o mundo."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
+
+    socket.on("world:list", async (ack) => {
+        try {
+            const userId = getAuthenticatedUserId(socket);
+
+            const result = await pool.query(
+                `
+                SELECT
+                    w.id,
+                    w.owner_id,
+                    w.name,
+                    w.description,
+                    w.visibility,
+                    w.seed,
+                    w.settings,
+                    w.max_players,
+                    w.created_at,
+                    w.updated_at,
+
+                    SELECT
+                        w.id,
+                        w.owner_id,
+                        w.name,
+                        w.description,
+                        w.visibility,
+                        w.seed,
+                        w.settings,
+                        w.max_players,
+                        w.created_at,
+                        w.updated_at,
+
+                        CASE
+                            WHEN w.owner_id = $1 THEN 'owner'
+                            ELSE wm.role
+                        END AS role,
+
+                        (wm.user_id IS NOT NULL) AS is_member
+
+                    FROM worlds w
+
+                    LEFT JOIN world_members wm
+                        ON wm.world_id = w.id
+                        AND wm.user_id = $1
+
+                    WHERE
+                        w.owner_id = $1
+
+                        OR wm.user_id = $1
+
+                        OR w.visibility = 'public'
+
+                    ORDER BY
+                        w.updated_at DESC,
+                        w.created_at DESC
+                `,
+                [userId]
+            );
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    worlds: result.rows
+                });
+            }
+
+        } catch (error) {
+            sendSocketError(
+                ack,
+                error,
+                "Não foi possível listar os mundos."
+            );
+        }
+    });
+
+    socket.on("world:load", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            const userId = getAuthenticatedUserId(socket);
+            const worldId = payload?.worldId;
+
+            if (
+                typeof worldId !== "string" ||
+                !UUID_REGEX.test(worldId)
+            ) {
+                throw createRequestError("Identificador do mundo inválido.");
+            }
+
+            client = await pool.connect();
+
+            await client.query(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ"
+            );
+
+            transactionStarted = true;
+
+            // Verifica se a conta é proprietária,
+            // membro ou se o mundo é público.
+            const worldResult = await client.query(
+                `
+                SELECT
+                    w.id,
+                    w.owner_id,
+                    w.name,
+                    w.description,
+                    w.visibility,
+                    w.seed,
+                    w.settings,
+                    w.max_players,
+                    w.created_at,
+                    w.updated_at
+
+                FROM worlds w
+
+                WHERE
+                    w.id = $1
+                    AND (
+                        w.owner_id = $2
+
+                        OR w.visibility = 'public'
+
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+
+                LIMIT 1
+                `,
+                [worldId, userId]
+            );
+
+            if (worldResult.rows.length === 0) {
+                throw createRequestError(
+                    "Mundo não encontrado ou você não possui acesso."
+                );
+            }
+
+            const world = worldResult.rows[0];
+
+            // Registra a associação de proprietários antigos
+            // ou de usuários que acessaram um mundo público.
+            if (
+                world.owner_id === userId ||
+                world.visibility === "public"
+            ) {
+                await client.query(
+                    `
+                    INSERT INTO world_members (
+                        world_id,
+                        user_id,
+                        role
+                    )
+                    VALUES ($1, $2, $3)
+
+                    ON CONFLICT (world_id, user_id)
+                    DO NOTHING
+                    `,
+                    [
+                        worldId,
+                        userId,
+                        world.owner_id === userId
+                            ? "owner"
+                            : "member"
+                    ]
+                );
+            }
+
+            // Carrega as alterações dos blocos.
+            const chunksResult = await client.query(
+                `
+                SELECT
+                    chunk_x,
+                    chunk_y,
+                    chunk_z,
+                    chunk_data
+
+                FROM world_chunks
+
+                WHERE world_id = $1
+
+                ORDER BY chunk_x, chunk_z, chunk_y
+                `,
+                [worldId]
+            );
+
+            // Carrega somente o estado do jogador autenticado.
+            const playerResult = await client.query(
+                `
+                SELECT
+                    world_id,
+                    user_id,
+                    position_x,
+                    position_y,
+                    position_z,
+                    player_data,
+                    updated_at
+
+                FROM player_world_states
+
+                WHERE
+                    world_id = $1
+                    AND user_id = $2
+
+                LIMIT 1
+                `,
+                [worldId, userId]
+            );
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+
+                    world,
+
+                    chunks: chunksResult.rows,
+
+                    playerState:
+                        playerResult.rows[0] ?? null
+                });
+            }
+
+            console.log(
+                `Mundo carregado: ${worldId} | Jogador: ${userId}`
+            );
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error("Erro no rollback:", rollbackError);
+                }
+            }
+
+            sendSocketError(
+                ack,
+                error,
+                "Não foi possível carregar o mundo."
+            );
+
+        } finally {
+            client?.release();
+        }
     });
 
     // Desconexão

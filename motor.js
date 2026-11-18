@@ -27252,65 +27252,184 @@ class kg {
         }))
     }
     async showWorlds() {
-        const t = await ss.listWorlds();
+        const localWorlds = await ss.listWorlds();
+
+        let sharedWorlds = [];
+
+        try {
+            sharedWorlds = await this.hooks.listSharedWorlds();
+        } catch (error) {
+            console.error(
+                "Erro ao carregar mundos compartilhados:",
+                error
+            );
+        }
+
+        const t = [
+            ...localWorlds.map(world => ({
+                ...world,
+                storage: "local"
+            })),
+
+            ...sharedWorlds
+        ].sort((a, b) => b.lastPlayed - a.lastPlayed);
+
         let e = t[0] ?? null;
+
         const n = j("div", {
             class: "world-list"
-        })
-          , s = re("Jogar Mundo", () => e && this.hooks.playWorld(e), {
-            wide: !0
-        })
-          , r = re("Excluir", () => e && this.confirmDelete(e))
-          , o = () => {
-            n.innerHTML = "",
-            t.length === 0 && n.append(j("div", {
-                class: "empty"
-            }, "Nenhum mundo ainda. Crie um novo!"));
-            for (const a of t) {
-                const l = j("div", {
-                    class: "world-entry" + ((e == null ? void 0 : e.id) === a.id ? " selected" : "")
-                }, a.thumb ? j("img", {
-                    class: "thumb",
-                    src: a.thumb
-                }) : j("div", {
-                    class: "thumb placeholder"
-                }), j("div", {
-                    class: "info"
-                }, j("div", {
-                    class: "wname"
-                }, a.name), j("div", {
-                    class: "wsub"
-                }, `Criado: ${lc(a.created)}`), j("div", {
-                    class: "wsub"
-                }, `Jogado: ${lc(a.lastPlayed)}`), j("div", {
-                    class: "wsub mode"
-                }, `${a.mode === "creative" ? "Criativo" : "Sobrevivência"} • ${Ps[a.difficulty]} • ${a.type === "flat" ? "Plano" : "Padrão"} • Seed: ${a.seedText || a.seed}`)));
-                l.addEventListener("click", () => {
-                    e = a,
-                    Zt.play("click"),
-                    o()
-                }
-                ),
-                l.addEventListener("dblclick", () => this.hooks.playWorld(a)),
-                n.append(l)
+        });
+
+        const s = re(
+            "Jogar Mundo",
+            () => e && this.hooks.playWorld(e),
+            {
+                wide: true
             }
-            s.disabled = !e,
-            r.disabled = !e
-        }
-        ;
-        o(),
-        this.show("worlds", j("div", {
-            class: "panel-title"
-        }, "Selecionar Mundo"), n, j("div", {
-            class: "world-buttons"
-        }, j("div", {
-            class: "btn-pair"
-        }, s, re("Criar Novo Mundo", () => this.showCreate(), {
-            wide: !0
-        })), j("div", {
-            class: "btn-pair"
-        }, r, re("Cancelar", () => this.showMainMenu()))))
+        );
+
+        const r = re(
+            "Excluir",
+            () => e && e.storage === "local" && this.confirmDelete(e)
+        );
+
+        const o = () => {
+            n.innerHTML = "";
+
+            if (t.length === 0) {
+                n.append(
+                    j("div", {
+                        class: "empty"
+                    }, "Nenhum mundo ainda. Crie um novo!")
+                );
+            }
+
+            for (const a of t) {
+                const l = j(
+                    "div",
+                    {
+                        class:
+                            "world-entry" +
+                            ((e?.id === a.id) ? " selected" : "")
+                    },
+
+                    a.thumb
+                        ? j("img", {
+                            class: "thumb",
+                            src: a.thumb
+                        })
+                        : j("div", {
+                            class: "thumb placeholder"
+                        }),
+
+                    j(
+                        "div",
+                        {
+                            class: "info"
+                        },
+
+                        j("div", {
+                            class: "wname"
+                        }, a.name),
+
+                        j("div", {
+                            class: "wsub"
+                        },
+                            a.storage === "shared"
+                                ? "☁ Mundo compartilhado"
+                                : "Salvo neste dispositivo"
+                        ),
+
+                        j("div", {
+                            class: "wsub"
+                        }, `Criado: ${lc(a.created)}`),
+
+                        j("div", {
+                            class: "wsub"
+                        }, `Jogado: ${lc(a.lastPlayed)}`),
+
+                        j("div", {
+                            class: "wsub mode"
+                        },
+                            `${a.mode === "creative" ? "Criativo" : "Sobrevivência"} • ` +
+                            `${Ps[a.difficulty] ?? "Normal"} • ` +
+                            `${a.type === "flat" ? "Plano" : "Padrão"} • ` +
+                            `Seed: ${a.seedText || a.seed}`
+                        )
+                    )
+                );
+
+                l.addEventListener("click", () => {
+                    e = a;
+                    Zt.play("click");
+                    o();
+                });
+
+                l.addEventListener("dblclick", () => {
+                    this.hooks.playWorld(a);
+                });
+
+                n.append(l);
+            }
+
+            s.disabled = !e;
+
+            // Mundos compartilhados não podem ser excluídos
+            // pela rotina local do IndexedDB.
+            r.disabled = !e || e.storage !== "local";
+        };
+
+        o();
+
+        this.show(
+            "worlds",
+
+            j("div", {
+                class: "panel-title"
+            }, "Selecionar Mundo"),
+
+            n,
+
+            j(
+                "div",
+                {
+                    class: "world-buttons"
+                },
+
+                j(
+                    "div",
+                    {
+                        class: "btn-pair"
+                    },
+
+                    s,
+
+                    re(
+                        "Criar Novo Mundo",
+                        () => this.showCreate(),
+                        {
+                            wide: true
+                        }
+                    )
+                ),
+
+                j(
+                    "div",
+                    {
+                        class: "btn-pair"
+                    },
+
+                    r,
+
+                    re(
+                        "Cancelar",
+                        () => this.showMainMenu()
+                    )
+                )
+            )
+        );
     }
+
     confirmDelete(t) {
         this.show("dialog", j("div", {
             class: "panel-title"
@@ -27341,7 +27460,14 @@ class kg {
             class: "mc-input",
             placeholder: "Deixe em branco para seed aleatória"
         })
-          , s = re("", () => {
+        , c = j("input", {
+            type: "checkbox"
+        })
+        , h = j("label", {},
+            c,
+            " Criar como mundo compartilhado associado à minha conta"
+        )
+        , s = re("", () => {
             t.mode = t.mode === "survival" ? "creative" : "survival",
             l()
         }
@@ -27377,12 +27503,13 @@ class kg {
             class: "panel-title"
         }, "Criar Novo Mundo"), j("div", {
             class: "form"
-        }, j("label", {}, "Nome do Mundo"), e, s, a, r, o, j("label", {}, "Seed para o gerador de mundos"), n), j("div", {
+        }, j("label", {}, "Nome do Mundo"), e, s, a, r, o, j("label", {}, "Seed para o gerador de mundos"), n, h), j("div", {
             class: "btn-pair"
         }, re("Criar Novo Mundo", () => this.hooks.createWorld({
             ...t,
             name: e.value.trim() || "Novo Mundo",
-            seed: n.value
+            seed: n.value,
+            shared: c.checked
         })), re("Cancelar", () => this.showWorlds()))),
         setTimeout( () => e.focus(), 0)
     }
@@ -27765,6 +27892,7 @@ class zg {
             settings: this.settings,
             openMultiplayer: () => this.openMultiplayer(),
             openAccount: () => this.openAccount(),
+            listSharedWorlds: () => this.listSharedWorlds(),
             authenticate: (mode, credentials) =>
                 this.authenticateAccount(mode, credentials),
             getCurrentUser: () => this.multiplayerUser,
@@ -28037,14 +28165,368 @@ class zg {
         this.multiplayerSocket.on("player:left", (data) => {
             this.removeRemotePlayer(data?.id ?? data);
         });
+
+        
+    }
+async ensureMultiplayerConnected() {
+    if (!this.multiplayerToken || !this.multiplayerUser) {
+        throw new Error("AUTH_REQUIRED");
     }
 
+    if (!window.io) {
+        throw new Error("Socket.IO não foi carregado.");
+    }
 
+    if (this.multiplayerSocket?.connected) {
+        return;
+    }
+
+    if (!this.multiplayerSocket) {
+        this.connectMultiplayer();
+    } else {
+        this.multiplayerSocket.connect();
+    }
+
+    const socket = this.multiplayerSocket;
+
+    if (!socket) {
+        throw new Error("Não foi possível iniciar a conexão.");
+    }
+
+    if (socket.connected) {
+        return;
+    }
+
+    await new Promise((resolve, reject) => {
+        let timeout;
+
+        const cleanup = () => {
+            clearTimeout(timeout);
+            socket.off("connect", onConnect);
+            socket.off("connect_error", onError);
+        };
+
+        const onConnect = () => {
+            cleanup();
+            resolve();
+        };
+
+        const onError = (error) => {
+            cleanup();
+            reject(error);
+        };
+
+        timeout = setTimeout(() => {
+            cleanup();
+            reject(new Error("Tempo limite de conexão com o servidor."));
+        }, 45000);
+
+        socket.once("connect", onConnect);
+        socket.once("connect_error", onError);
+
+        if (socket.connected) {
+            onConnect();
+        }
+    });
+}
+
+
+async requestWorldEvent(eventName, payload = {}) {
+    await this.ensureMultiplayerConnected();
+
+    const socket = this.multiplayerSocket;
+
+    return new Promise((resolve, reject) => {
+        let finished = false;
+
+        const timeout = setTimeout(() => {
+            if (finished) return;
+
+            finished = true;
+
+            reject(
+                new Error(
+                    `O servidor não respondeu ao evento ${eventName}.`
+                )
+            );
+        }, 45000);
+
+        socket.emit(eventName, payload, (response) => {
+            if (finished) return;
+
+            finished = true;
+            clearTimeout(timeout);
+
+            if (!response || response.success !== true) {
+                reject(
+                    new Error(
+                        response?.message ||
+                        `Falha na operação ${eventName}.`
+                    )
+                );
+
+                return;
+            }
+
+            resolve(response);
+        });
+    });
+}
+
+
+normalizeSharedWorld(world) {
+    if (!world || typeof world.id !== "string") {
+        throw new Error("O servidor retornou um mundo inválido.");
+    }
+
+    const settings =
+        world.settings && typeof world.settings === "object"
+            ? world.settings
+            : {};
+
+    const seedText = String(world.seed ?? "0");
+
+    const parseDate = (value, fallback) => {
+        const result =
+            typeof value === "number"
+                ? value
+                : Date.parse(value);
+
+        return Number.isFinite(result) ? result : fallback;
+    };
+
+    const now = Date.now();
+    const created = parseDate(
+        world.created_at ?? world.createdAt,
+        now
+    );
+
+    const lastPlayed = parseDate(
+        world.updated_at ?? world.updatedAt,
+        created
+    );
+
+    const difficulty = Number(settings.difficulty);
+
+    return {
+        id: world.id,
+        name: world.name || "Mundo compartilhado",
+
+        description: world.description || "",
+
+        created,
+        lastPlayed,
+
+        mode:
+            settings.mode === "creative"
+                ? "creative"
+                : "survival",
+
+        difficulty:
+            Number.isInteger(difficulty) &&
+            difficulty >= 0 &&
+            difficulty <= 3
+                ? difficulty
+                : 2,
+
+        seed: H0(seedText),
+        seedText,
+
+        type:
+            settings.type === "flat"
+                ? "flat"
+                : "default",
+
+        storage: "shared",
+        visibility: world.visibility || "private",
+        ownerId: world.owner_id ?? null,
+        settings
+    };
+}
+
+
+async listSharedWorlds() {
+    if (!this.multiplayerToken || !this.multiplayerUser) {
+        return [];
+    }
+
+    const response = await this.requestWorldEvent(
+        "world:list"
+    );
+
+    if (!Array.isArray(response.worlds)) {
+        throw new Error("A lista de mundos retornada é inválida.");
+    }
+
+    return response.worlds.map((world) =>
+        this.normalizeSharedWorld(world)
+    );
+}
+
+
+async createSharedWorld(meta) {
+    const response = await this.requestWorldEvent(
+        "world:create",
+        {
+            name: meta.name,
+            description: "",
+            visibility: "private",
+            seed: String(meta.seedText),
+
+            settings: {
+                mode: meta.mode,
+                difficulty: meta.difficulty,
+                type: meta.type,
+
+                time: 1000,
+                day: 0,
+
+                chests: {},
+                furnaces: {},
+                animals: [],
+                saplings: []
+            }
+        }
+    );
+
+    return this.normalizeSharedWorld(response.world);
+}
+
+
+async loadSharedWorld(worldId) {
+    const response = await this.requestWorldEvent(
+        "world:load",
+        {
+            worldId
+        }
+    );
+
+    const meta = this.normalizeSharedWorld(response.world);
+    const settings = meta.settings;
+
+    const mods = {};
+
+    if (!Array.isArray(response.chunks)) {
+        throw new Error("O servidor retornou chunks inválidos.");
+    }
+
+    for (const chunk of response.chunks) {
+        const chunkX = Number(chunk.chunk_x);
+        const chunkY = Number(chunk.chunk_y ?? 0);
+        const chunkZ = Number(chunk.chunk_z);
+
+        if (
+            !Number.isInteger(chunkX) ||
+            !Number.isInteger(chunkY) ||
+            !Number.isInteger(chunkZ)
+        ) {
+            continue;
+        }
+
+        // O motor atual utiliza chunks verticais completos.
+        // Portanto, a coordenada vertical persistida é 0.
+        if (chunkY !== 0) {
+            continue;
+        }
+
+        if (!Array.isArray(chunk.chunk_data)) {
+            throw new Error("Um dos chunks está corrompido.");
+        }
+
+        mods[`${chunkX},${chunkZ}`] = chunk.chunk_data;
+    }
+
+    let player = null;
+
+    if (response.playerState) {
+        const saved = response.playerState;
+        const playerData = saved.player_data || {};
+
+        const x = Number(saved.position_x);
+        const y = Number(saved.position_y);
+        const z = Number(saved.position_z);
+
+        player = {
+            ...playerData,
+
+            x: Number.isFinite(x) ? x : 0,
+            y: Number.isFinite(y) ? y : 0,
+            z: Number.isFinite(z) ? z : 0,
+
+            yaw: Number(playerData.yaw) || 0,
+            pitch: Number(playerData.pitch) || 0,
+
+            health: Number.isFinite(Number(playerData.health))
+                ? Number(playerData.health)
+                : 20,
+
+            hunger: Number.isFinite(Number(playerData.hunger))
+                ? Number(playerData.hunger)
+                : 20,
+
+            saturation: Number.isFinite(Number(playerData.saturation))
+                ? Number(playerData.saturation)
+                : 5,
+
+            inv: playerData.inv ?? [],
+            selected: Number(playerData.selected) || 0,
+
+            spawn:
+                Array.isArray(playerData.spawn) &&
+                playerData.spawn.length === 3 &&
+                playerData.spawn.every(value =>
+                    Number.isFinite(Number(value))
+                )
+                    ? playerData.spawn.map(Number)
+                    : [
+                        Number.isFinite(x) ? x : 0,
+                        Number.isFinite(y) ? y : 0,
+                        Number.isFinite(z) ? z : 0
+                    ],
+
+            hasBedSpawn: !!playerData.hasBedSpawn,
+            flying: !!playerData.flying
+        };
+    }
+
+    const data = {
+        id: meta.id,
+        version: 1,
+
+        player,
+
+        time: Number.isFinite(Number(settings.time))
+            ? Number(settings.time)
+            : 1000,
+
+        day: Number.isFinite(Number(settings.day))
+            ? Number(settings.day)
+            : 0,
+
+        mods,
+
+        chests: settings.chests ?? {},
+        furnaces: settings.furnaces ?? {},
+        animals: Array.isArray(settings.animals)
+            ? settings.animals
+            : [],
+
+        saplings: Array.isArray(settings.saplings)
+            ? settings.saplings
+            : []
+    };
+
+    return {
+        meta,
+        data
+    };
+}
     joinMultiplayerWorld() {
         if (
             !this.multiplayerSocket?.connected ||
             !this.multiplayerUser ||
             !this.meta ||
+            this.meta.storage !== "shared" ||
             this.state !== "playing" ||
             this.multiplayerWorldId ||
             this.multiplayerJoining
@@ -28052,22 +28534,13 @@ class zg {
             return;
         }
 
-        const roomId = window.prompt(
-            "Digite o código da sala multiplayer:",
-            this.multiplayerRoomCode || this.meta.id
-        );
-
-        if (!roomId || !roomId.trim()) {
-            return;
-        }
-
-        this.multiplayerRoomCode = roomId.trim();
+        this.multiplayerRoomCode = this.meta.id;
         this.multiplayerJoining = true;
 
         this.multiplayerSocket.emit(
             "world:join",
             {
-                worldId: this.multiplayerRoomCode
+                worldId: this.meta.id
             },
             (response) => {
                 this.multiplayerJoining = false;
@@ -28075,34 +28548,28 @@ class zg {
                 if (!response?.success) {
                     this.ui.toast(
                         response?.message ||
-                        "Não foi possível entrar na sala."
+                        "Não foi possível entrar no mundo."
                     );
 
                     return;
                 }
 
-                this.multiplayerWorldId = response.worldId;
+                this.multiplayerWorldId =
+                    response.worldId || this.meta.id;
 
                 for (const player of response.players || []) {
                     this.updateRemotePlayer(player);
                 }
 
                 console.log(
-                    "Sala multiplayer:",
-                    response.worldId
+                    "Mundo compartilhado conectado:",
+                    this.multiplayerWorldId
                 );
 
                 this.ui.toast("Multiplayer conectado!");
-
-                window.alert(
-                    "Você entrou na sala multiplayer!\n\n" +
-                    "Código da sala: " +
-                    response.worldId
-                );
             }
         );
     }
-
 
     updateRemotePlayer(data) {
     const player = data?.player ?? data;
@@ -28272,26 +28739,105 @@ class zg {
         this.mining = null
     }
     async createWorld(t) {
-        const e = H0(t.seed)
-          , n = Date.now()
-          , s = {
-            id: `w${n.toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
+        const seed = H0(t.seed);
+        const now = Date.now();
+
+        const meta = {
+            id: `w${now.toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
+
             name: t.name,
-            created: n,
-            lastPlayed: n,
+            created: now,
+            lastPlayed: now,
+
             mode: t.mode,
             difficulty: t.difficulty,
-            seed: e,
-            seedText: t.seed.trim() || String(e),
-            type: t.type
+
+            seed,
+            seedText: t.seed.trim() || String(seed),
+
+            type: t.type,
+            storage: "local"
         };
-        await ss.saveMeta(s),
-        this.startWorld(s, null)
+
+        // Criação de um mundo associado à conta.
+        if (t.shared) {
+            if (!this.multiplayerToken || !this.multiplayerUser) {
+                this.multiplayerPendingAuth = true;
+
+                this.ui.showAccount(
+                    "login",
+                    "Entre na sua conta para criar um mundo compartilhado."
+                );
+
+                return;
+            }
+
+            try {
+                this.ui.showLoading(
+                    "Criando mundo compartilhado...",
+                    0
+                );
+
+                const sharedMeta = await this.createSharedWorld(meta);
+
+                await this.playWorld(sharedMeta);
+
+            } catch (error) {
+                console.error(
+                    "Erro ao criar mundo compartilhado:",
+                    error
+                );
+
+                this.ui.toast(
+                    error.message || "Não foi possível criar o mundo."
+                );
+
+                this.ui.showWorlds();
+            }
+
+            return;
+        }
+
+        // Criação tradicional: mantém o IndexedDB.
+        await ss.saveMeta(meta);
+
+        this.startWorld(meta, null);
     }
+
+
     async playWorld(t) {
         this.ui.showLoading("Carregando mundo...", 0);
-        const e = await ss.loadData(t.id);
-        this.startWorld(t, e)
+
+        // Carregamento pelo PostgreSQL.
+        if (t.storage === "shared") {
+            try {
+                const result = await this.loadSharedWorld(t.id);
+
+                this.startWorld(
+                    result.meta,
+                    result.data
+                );
+
+            } catch (error) {
+                console.error(
+                    "Erro ao carregar mundo compartilhado:",
+                    error
+                );
+
+                this.ui.toast(
+                    error.message || "Não foi possível carregar o mundo."
+                );
+
+                this.ui.showWorlds();
+            }
+
+            return;
+        }
+
+        // Carregamento tradicional pelo IndexedDB.
+        const data = await ss.loadData(t.id);
+
+        this.startWorld(t, data);
     }
     startWorld(t, e) {
         Zt.init(),
