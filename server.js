@@ -857,11 +857,10 @@ io.on("connection", (socket) => {
         }
     });
 
-
-
     socket.on("world:list", async (payload = {}, ack) => {
 
         try {
+
             const userId = getAuthenticatedUserId(socket);
 
             const result = await pool.query(
@@ -878,59 +877,62 @@ io.on("connection", (socket) => {
                     w.created_at,
                     w.updated_at,
 
-                    SELECT
-                        w.id,
-                        w.owner_id,
-                        w.name,
-                        w.description,
-                        w.visibility,
-                        w.seed,
-                        w.settings,
-                        w.max_players,
-                        w.created_at,
-                        w.updated_at,
+                    CASE
+                        WHEN w.owner_id = $1 THEN 'owner'
+                        ELSE COALESCE(wm.role, 'member')
+                    END AS role,
 
-                        CASE
-                            WHEN w.owner_id = $1 THEN 'owner'
-                            ELSE wm.role
-                        END AS role,
+                    (wm.user_id IS NOT NULL) AS is_member
 
-                        (wm.user_id IS NOT NULL) AS is_member
+                FROM worlds w
 
-                    FROM worlds w
+                LEFT JOIN world_members wm
+                    ON wm.world_id = w.id
+                    AND wm.user_id = $1
 
-                    LEFT JOIN world_members wm
-                        ON wm.world_id = w.id
-                        AND wm.user_id = $1
+                WHERE
+                    w.owner_id = $1
 
-                    WHERE
-                        w.owner_id = $1
+                    OR wm.user_id = $1
 
-                        OR wm.user_id = $1
+                    OR w.visibility = 'public'
 
-                        OR w.visibility = 'public'
-
-                    ORDER BY
-                        w.updated_at DESC,
-                        w.created_at DESC
+                ORDER BY
+                    w.updated_at DESC,
+                    w.created_at DESC
                 `,
                 [userId]
             );
 
+
             if (typeof ack === "function") {
+
                 ack({
+
                     success: true,
+
                     worlds: result.rows
+
                 });
+
             }
 
+
         } catch (error) {
+
+            console.error(
+                "Erro em world:list:",
+                error
+            );
+
             sendSocketError(
                 ack,
                 error,
                 "Não foi possível listar os mundos."
             );
+
         }
+
     });
 
     socket.on("world:load", async (payload = {}, ack) => {
