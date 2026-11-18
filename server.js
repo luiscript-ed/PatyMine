@@ -858,7 +858,9 @@ io.on("connection", (socket) => {
     });
 
 
-    socket.on("world:list", async (ack) => {
+
+    socket.on("world:list", async (payload = {}, ack) => {
+
         try {
             const userId = getAuthenticatedUserId(socket);
 
