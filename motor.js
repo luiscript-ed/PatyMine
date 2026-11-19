@@ -23980,21 +23980,26 @@ class rc {
           , r = this.getChunk(n, s);
         return r ? r.biomes[t - n * tt + (e - s * tt) * tt] : this.gen.column(t, e).biome
     }
-    setBlock(t, e, n, s, r=0, o=!0, a=!0) {
+    setBlock(t, e, n, s, r = 0, o = !0, a = !0) {
         var m;
         if (e < 0 || e >= Wt)
             return;
+
         const l = Math.floor(t / tt)
-          , c = Math.floor(n / tt)
-          , h = this.getChunk(l, c);
+        , c = Math.floor(n / tt)
+        , h = this.getChunk(l, c);
         if (!h)
             return;
+
         const u = t - l * tt
-          , f = n - c * tt
-          , p = xe(u, e, f)
-          , g = h.blocks[p];
-        if (g === s && h.meta[p] === r)
+        , f = n - c * tt
+        , p = xe(u, e, f)
+        , g = h.blocks[p]
+        , oldMeta = h.meta[p];
+
+        if (g === s && oldMeta === r)
             return;
+
         if (h.blocks[p] = s,
         h.meta[p] = r,
         o) {
@@ -24002,8 +24007,9 @@ class rc {
             let x = this.mods.get(d);
             x || (x = new Map,
             this.mods.set(d, x)),
-            x.set(p, s | r << 8)
+            x.set(p, s | r << 8);
         }
+
         const _ = [h];
         for (let d = -1; d <= 1; d++)
             for (let x = -1; x <= 1; x++) {
@@ -24013,17 +24019,31 @@ class rc {
                 if (!v)
                     continue;
                 const S = x === 0 || (x < 0 ? u === 0 : u === tt - 1)
-                  , L = d === 0 || (d < 0 ? f === 0 : f === tt - 1);
-                S && L ? _.push(v) : v.dirty = !0
+                , L = d === 0 || (d < 0 ? f === 0 : f === tt - 1);
+                S && L ? _.push(v) : v.dirty = !0;
             }
+
         if (a)
             for (const d of _)
                 this.remesh(d);
         else
             for (const d of _)
                 d.dirty = !0;
-        (m = this.onBlockChanged) == null || m.call(this, t, e, n, g, s)
+
+        (m = this.onBlockChanged) == null ||
+            m.call(
+                this,
+                t,
+                e,
+                n,
+                g,
+                s,
+                oldMeta,
+                r,
+                o
+            )
     }
+
     update(t, e, n) {
         const s = performance.now()
           , r = Math.floor(t / tt)
@@ -27769,6 +27789,11 @@ class zg {
         this.multiplayerRoomCode = null;
         this.multiplayerJoining = false;
         this.multiplayerMoveTimer = 0;
+
+        this.pendingBlockChanges = [];
+        this.blockChangeFlushTimer = null;
+        this.blockChangeFlushPromise = null;
+        this.applyingRemoteBlockChange = false;
         this.remotePlayers = new Map();
 
         this.multiplayerToken = sessionStorage.getItem("patycraft_token");
@@ -28166,6 +28191,13 @@ class zg {
             this.removeRemotePlayer(data?.id ?? data);
         });
 
+        this.multiplayerSocket.on(
+            "world:blocks:changed",
+            (payload) => {
+                this.applyRemoteBlockChanges(payload);
+            }
+        );
+
         
     }
 async ensureMultiplayerConnected() {
@@ -28370,7 +28402,7 @@ async createSharedWorld(meta) {
         {
             name: meta.name,
             description: "",
-            visibility: "private",
+            visibility: "public",
             seed: String(meta.seedText),
 
             settings: {
@@ -28567,6 +28599,7 @@ async loadSharedWorld(worldId) {
                 );
 
                 this.ui.toast("Multiplayer conectado!");
+                void this.flushSharedBlockChanges();
             }
         );
     }
@@ -28977,14 +29010,52 @@ async loadSharedWorld(worldId) {
         this.ui.showPause())
     }
     async saveAndQuit() {
-        this.ui.containers.open && this.ui.containers.close(),
-        this.ui.showLoading("Salvando mundo...", .5),
-        await this.save(!0),
-        this.input.unlock(),
-        this.ui.setHudVisible(!1),
-        this.meta = null,
-        this.startPanorama(),
-        this.ui.showMainMenu()
+
+        this.ui.containers.open &&
+        this.ui.containers.close();
+
+
+        this.ui.showLoading(
+            "Salvando mundo...",
+            .5
+        );
+
+
+        // Garante que os lotes pendentes sejam confirmados.
+
+        const blocksSaved =
+            await this.flushSharedBlockChanges();
+
+
+        if (
+            !blocksSaved &&
+            this.pendingBlockChanges.length > 0
+        ) {
+
+            this.ui.toast(
+                "Não foi possível confirmar o salvamento dos blocos. Verifique sua conexão."
+            );
+
+            return;
+
+        }
+
+
+        // Mantém o salvamento original do motor.
+
+        await this.save(!0);
+
+
+        this.input.unlock();
+
+        this.ui.setHudVisible(!1);
+
+        this.meta = null;
+
+        this.startPanorama();
+
+        this.ui.showMainMenu();
+
     }
     captureThumb() {
         try {
@@ -29762,7 +29833,369 @@ async loadSharedWorld(worldId) {
             }
         }
     }
-    onBlockChanged(t, e, n, s, r) {}
+    
+    onBlockChanged(
+        x,
+        y,
+        z,
+        oldBlock,
+        newBlock,
+        oldMeta,
+        newMeta,
+        persistent
+     ) {
+
+        // Ignora alterações que não devem ser persistidas.
+        // Também evita retransmitir modificações remotas.
+
+        if (
+            !persistent ||
+            this.applyingRemoteBlockChange
+        ) {
+            return;
+        }
+
+
+        // Somente mundos compartilhados utilizam PostgreSQL.
+
+        if (
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            this.state !== "playing"
+        ) {
+            return;
+        }
+
+
+        // Adiciona a alteração à fila.
+
+        this.pendingBlockChanges.push({
+
+            worldId: this.meta.id,
+
+            x,
+            y,
+            z,
+
+            blockId: newBlock,
+            meta: newMeta
+
+        });
+
+
+        // Quando atingimos o limite, envia imediatamente.
+
+        if (this.pendingBlockChanges.length >= 128) {
+
+            void this.flushSharedBlockChanges();
+
+            return;
+
+        }
+
+
+        // Agrupa pequenas alterações em intervalos de 75 ms.
+
+        if (this.blockChangeFlushTimer === null) {
+
+            this.blockChangeFlushTimer = setTimeout(() => {
+
+                this.blockChangeFlushTimer = null;
+
+                void this.flushSharedBlockChanges();
+
+            }, 75);
+
+        }
+
+    }
+
+
+    async flushSharedBlockChanges() {
+
+        // Cancela o temporizador pendente.
+
+        if (this.blockChangeFlushTimer !== null) {
+
+            clearTimeout(this.blockChangeFlushTimer);
+
+            this.blockChangeFlushTimer = null;
+
+        }
+
+
+        // Não inicia dois envios simultâneos.
+
+        if (this.blockChangeFlushPromise) {
+            return this.blockChangeFlushPromise;
+        }
+
+
+        if (this.pendingBlockChanges.length === 0) {
+            return true;
+        }
+
+
+        const worldId = this.pendingBlockChanges[0].worldId;
+
+
+        // Exige que a conexão esteja dentro do mundo correspondente.
+
+        if (
+            !this.multiplayerSocket?.connected ||
+            this.multiplayerWorldId !== worldId ||
+            this.meta?.id !== worldId
+        ) {
+            return false;
+        }
+
+
+        // Retira até 128 alterações da fila.
+
+        const batch = [];
+
+        while (
+            batch.length < 128 &&
+            this.pendingBlockChanges[0]?.worldId === worldId
+        ) {
+
+            batch.push(
+                this.pendingBlockChanges.shift()
+            );
+
+        }
+
+
+        const changes = batch.map(
+            ({ worldId, ...change }) => change
+        );
+
+
+        const socket = this.multiplayerSocket;
+
+
+        // Envia o lote e aguarda confirmação do servidor.
+
+        const flushPromise = (async () => {
+
+            try {
+
+                await new Promise((resolve, reject) => {
+
+                    socket.timeout(15000).emit(
+                        "world:blocks:change",
+
+                        {
+                            worldId,
+                            changes
+                        },
+
+                        (error, response) => {
+
+                            if (error) {
+                                reject(error);
+                                return;
+                            }
+
+                            if (!response?.success) {
+
+                                reject(
+                                    new Error(
+                                        response?.message ||
+                                        "O servidor não conseguiu salvar os blocos."
+                                    )
+                                );
+
+                                return;
+                            }
+
+                            resolve(response);
+
+                        }
+                    );
+
+                });
+
+            } catch (error) {
+
+                // Devolve o lote à fila caso o envio falhe.
+
+                this.pendingBlockChanges.unshift(...batch);
+
+                console.error(
+                    "Erro ao persistir blocos:",
+                    error
+                );
+
+                this.ui.toast(
+                    error.message ||
+                    "Não foi possível salvar as alterações."
+                );
+
+                return false;
+
+            } finally {
+
+                this.blockChangeFlushPromise = null;
+
+            }
+
+
+            // Continua enviando os lotes restantes.
+
+            if (
+                this.pendingBlockChanges.length > 0 &&
+                this.pendingBlockChanges[0].worldId === worldId
+            ) {
+
+                return this.flushSharedBlockChanges();
+
+            }
+
+
+            return this.pendingBlockChanges.length === 0;
+
+        })();
+
+
+        this.blockChangeFlushPromise = flushPromise;
+
+        return flushPromise;
+
+    }
+
+
+    applyRemoteBlockChanges(payload) {
+
+        if (
+            !payload ||
+            !Array.isArray(payload.changes) ||
+            !this.world ||
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            payload.worldId !== this.meta.id ||
+            this.multiplayerWorldId !== this.meta.id
+        ) {
+            return;
+        }
+
+
+        this.applyingRemoteBlockChange = true;
+
+        try {
+
+            for (const change of payload.changes) {
+
+                const { x, y, z, blockId } = change;
+
+                const meta = change.meta ?? 0;
+
+
+                // Valida novamente os dados recebidos.
+
+                if (
+                    ![
+                        x,
+                        y,
+                        z,
+                        blockId,
+                        meta
+                    ].every(Number.isSafeInteger)
+                ) {
+                    continue;
+                }
+
+
+                if (
+                    Math.abs(x) > 100000 ||
+                    Math.abs(z) > 100000 ||
+                    y < 0 ||
+                    y >= Wt ||
+                    blockId < 0 ||
+                    blockId > 255 ||
+                    meta < 0 ||
+                    meta > 255
+                ) {
+                    continue;
+                }
+
+
+                // Recupera as coordenadas do chunk.
+
+                const chunkX = Math.floor(x / tt);
+                const chunkZ = Math.floor(z / tt);
+
+
+                const localX = x - chunkX * tt;
+                const localZ = z - chunkZ * tt;
+
+
+                // Utiliza exatamente a estrutura interna do motor.
+
+                const chunkKey = Is(chunkX, chunkZ);
+
+                const index = xe(
+                    localX,
+                    y,
+                    localZ
+                );
+
+
+                const packedValue =
+                    blockId | (meta << 8);
+
+
+                // Atualiza as modificações persistentes locais.
+                // Isso também funciona se o chunk não estiver carregado.
+
+                let chunkMods = this.world.mods.get(chunkKey);
+
+                if (!chunkMods) {
+
+                    chunkMods = new Map();
+
+                    this.world.mods.set(
+                        chunkKey,
+                        chunkMods
+                    );
+
+                }
+
+
+                chunkMods.set(
+                    index,
+                    packedValue
+                );
+
+
+                // Atualiza a renderização somente se o chunk
+                // estiver carregado no momento.
+
+                if (this.world.getChunk(chunkX, chunkZ)) {
+
+                    this.world.setBlock(
+                        x,
+                        y,
+                        z,
+                        blockId,
+                        meta,
+                        false,
+                        true
+                    );
+
+                }
+
+            }
+
+        } finally {
+
+            this.applyingRemoteBlockChange = false;
+
+        }
+
+    }
+
+
     tickBlockEntities(t) {
         const e = this.world;
         this.furnaceFxT -= t;

@@ -14,6 +14,16 @@ const { pool, testarBanco } = require("./db");
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS_PER_WORLD = 16;
 
+// Estrutura vertical e horizontal dos chunks.
+const CHUNK_SIZE = 16;
+const WORLD_HEIGHT = 128;
+
+// Limite de alterações por requisição.
+const MAX_BLOCK_CHANGES_PER_BATCH = 128;
+
+// Limite das coordenadas do mundo.
+const MAX_WORLD_COORDINATE = 100000;
+
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
@@ -717,6 +727,497 @@ io.on("connection", (socket) => {
     socket.on("world:leave", () => {
         leaveWorld(socket);
     });
+    
+
+    socket.on("world:blocks:change", async (payload = {}, ack) => {
+
+        let client;
+        let transactionStarted = false;
+
+        try {
+
+            // 1. Recupera a identidade autenticada.
+
+            const userId = getAuthenticatedUserId(socket);
+            const worldId = payload?.worldId;
+
+
+            if (!isValidWorldId(worldId)) {
+                throw createRequestError(
+                    "Identificador de mundo inválido."
+                );
+            }
+
+
+            // 2. Verifica se o jogador está conectado ao mundo.
+
+            if (socket.data.worldId !== worldId) {
+                throw createRequestError(
+                    "Você não está conectado a este mundo."
+                );
+            }
+
+            const activeWorld = worlds.get(worldId);
+            const activePlayer = activeWorld?.get(userId);
+
+            if (
+                !activePlayer ||
+                activePlayer.socketId !== socket.id
+            ) {
+                throw createRequestError(
+                    "Sessão de jogador inválida."
+                );
+            }
+
+
+            // 3. Valida o lote recebido.
+
+            if (
+                !Array.isArray(payload.changes) ||
+                payload.changes.length === 0 ||
+                payload.changes.length > MAX_BLOCK_CHANGES_PER_BATCH
+            ) {
+                throw createRequestError(
+                    "Quantidade de alterações inválida."
+                );
+            }
+
+
+            // Elimina alterações repetidas na mesma posição.
+            // A última alteração recebida prevalece.
+
+            const changesByPosition = new Map();
+
+            for (const change of payload.changes) {
+
+                if (!isPlainObject(change)) {
+                    throw createRequestError(
+                        "Alteração de bloco inválida."
+                    );
+                }
+
+                const x = change.x;
+                const y = change.y;
+                const z = change.z;
+
+                const blockId = change.blockId;
+                const meta = change.meta ?? 0;
+
+
+                if (
+                    ![
+                        x,
+                        y,
+                        z,
+                        blockId,
+                        meta
+                    ].every(Number.isSafeInteger)
+                ) {
+                    throw createRequestError(
+                        "Coordenadas ou dados de bloco inválidos."
+                    );
+                }
+
+
+                if (
+                    Math.abs(x) > MAX_WORLD_COORDINATE ||
+                    Math.abs(z) > MAX_WORLD_COORDINATE
+                ) {
+                    throw createRequestError(
+                        "Coordenadas fora dos limites permitidos."
+                    );
+                }
+
+
+                if (
+                    y < 0 ||
+                    y >= WORLD_HEIGHT ||
+                    blockId < 0 ||
+                    blockId > 255 ||
+                    meta < 0 ||
+                    meta > 255
+                ) {
+                    throw createRequestError(
+                        "Dados de bloco fora dos limites permitidos."
+                    );
+                }
+
+
+                const key = `${x},${y},${z}`;
+
+                changesByPosition.set(key, {
+                    x,
+                    y,
+                    z,
+                    blockId,
+                    meta
+                });
+
+            }
+
+
+            const changes = Array.from(
+                changesByPosition.values()
+            );
+
+
+            // 4. Agrupa as modificações por chunk.
+
+            const chunkGroups = new Map();
+
+            for (const change of changes) {
+
+                const chunkX = Math.floor(
+                    change.x / CHUNK_SIZE
+                );
+
+                const chunkZ = Math.floor(
+                    change.z / CHUNK_SIZE
+                );
+
+
+                const localX =
+                    change.x - chunkX * CHUNK_SIZE;
+
+                const localZ =
+                    change.z - chunkZ * CHUNK_SIZE;
+
+
+                // Índice utilizado pelo motor Three.js.
+                const index =
+                    localX +
+                    localZ * CHUNK_SIZE +
+                    change.y * CHUNK_SIZE * CHUNK_SIZE;
+
+
+                // Combina ID do bloco e metadados.
+                const packedValue =
+                    change.blockId |
+                    (change.meta << 8);
+
+
+                const key = `${chunkX},${chunkZ}`;
+
+                let group = chunkGroups.get(key);
+
+                if (!group) {
+
+                    group = {
+                        chunkX,
+                        chunkZ,
+                        values: new Map()
+                    };
+
+                    chunkGroups.set(key, group);
+
+                }
+
+
+                group.values.set(index, packedValue);
+
+            }
+
+
+            // 5. Abre uma transação PostgreSQL.
+
+            client = await pool.connect();
+
+            await client.query("BEGIN");
+
+            transactionStarted = true;
+
+
+            // 6. Confirma novamente a autorização.
+            // Protege contra operações após a revogação do acesso.
+
+            const accessResult = await client.query(
+                `
+                SELECT w.id
+
+                FROM worlds w
+
+                WHERE
+                    w.id = $1
+
+                    AND (
+                        w.owner_id = $2
+
+                        OR w.visibility = 'public'
+
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+
+                FOR SHARE OF w
+                `,
+                [worldId, userId]
+            );
+
+
+            if (accessResult.rows.length === 0) {
+                throw createRequestError(
+                    "Você não possui autorização para modificar este mundo."
+                );
+            }
+
+
+            // 7. Ordena os chunks para manter uma ordem
+            // consistente de bloqueio entre transações.
+
+            const orderedGroups = Array.from(
+                chunkGroups.values()
+            ).sort((a, b) =>
+                a.chunkX - b.chunkX ||
+                a.chunkZ - b.chunkZ
+            );
+
+
+            // 8. Processa cada chunk individualmente.
+
+            for (const group of orderedGroups) {
+
+                const { chunkX, chunkZ } = group;
+
+
+                // Cria o registro caso ainda não exista.
+                // A chave primária evita duplicações.
+
+                await client.query(
+                    `
+                    INSERT INTO world_chunks (
+                        world_id,
+                        chunk_x,
+                        chunk_y,
+                        chunk_z,
+                        chunk_data
+                    )
+
+                    VALUES (
+                        $1,
+                        $2,
+                        0,
+                        $3,
+                        '[]'::jsonb
+                    )
+
+                    ON CONFLICT (
+                        world_id,
+                        chunk_x,
+                        chunk_y,
+                        chunk_z
+                    )
+
+                    DO NOTHING
+                    `,
+                    [
+                        worldId,
+                        chunkX,
+                        chunkZ
+                    ]
+                );
+
+
+                // Bloqueia a linha durante a atualização.
+                // Isso protege alterações simultâneas.
+
+                const chunkResult = await client.query(
+                    `
+                    SELECT chunk_data
+
+                    FROM world_chunks
+
+                    WHERE
+                        world_id = $1
+                        AND chunk_x = $2
+                        AND chunk_y = 0
+                        AND chunk_z = $3
+
+                    FOR UPDATE
+                    `,
+                    [
+                        worldId,
+                        chunkX,
+                        chunkZ
+                    ]
+                );
+
+
+                const storedData =
+                    chunkResult.rows[0]?.chunk_data;
+
+
+                if (!Array.isArray(storedData)) {
+                    throw new Error(
+                        "Formato de chunk inválido no PostgreSQL."
+                    );
+                }
+
+
+                // Recupera as modificações já existentes.
+
+                const modifications = new Map();
+
+                for (const entry of storedData) {
+
+                    if (
+                        !Array.isArray(entry) ||
+                        entry.length !== 2 ||
+                        !Number.isSafeInteger(entry[0]) ||
+                        !Number.isSafeInteger(entry[1]) ||
+                        entry[0] < 0 ||
+                        entry[0] >= CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT ||
+                        entry[1] < 0 ||
+                        entry[1] > 65535
+                    ) {
+                        throw new Error(
+                            "Dados de chunk corrompidos no PostgreSQL."
+                        );
+                    }
+
+                    modifications.set(
+                        entry[0],
+                        entry[1]
+                    );
+
+                }
+
+
+                // Aplica somente as alterações recebidas.
+                // Não sobrescreve as demais construções.
+
+                for (const [index, packedValue] of group.values) {
+
+                    modifications.set(
+                        index,
+                        packedValue
+                    );
+
+                }
+
+
+                // Serializa novamente no formato original:
+                // [[indice, valor], [indice, valor], ...]
+
+                const chunkData = Array.from(
+                    modifications.entries()
+                ).sort((a, b) => a[0] - b[0]);
+
+
+                await client.query(
+                    `
+                    UPDATE world_chunks
+
+                    SET
+                        chunk_data = $5::jsonb,
+                        updated_at = NOW()
+
+                    WHERE
+                        world_id = $1
+                        AND chunk_x = $2
+                        AND chunk_y = $3
+                        AND chunk_z = $4
+                    `,
+                    [
+                        worldId,
+                        chunkX,
+                        0,
+                        chunkZ,
+                        JSON.stringify(chunkData)
+                    ]
+                );
+
+            }
+
+
+            // 9. Atualiza a data de modificação do mundo.
+
+            await client.query(
+                `
+                UPDATE worlds
+
+                SET updated_at = NOW()
+
+                WHERE id = $1
+                `,
+                [worldId]
+            );
+
+
+            // 10. Confirma a transação.
+
+            await client.query("COMMIT");
+
+            transactionStarted = false;
+
+
+            // 11. Transmite somente depois da gravação.
+            // O próprio remetente não recebe a transmissão.
+
+            socket.to(worldId).emit(
+                "world:blocks:changed",
+                {
+                    worldId,
+                    changes
+                }
+            );
+
+
+            if (typeof ack === "function") {
+
+                ack({
+                    success: true,
+                    saved: changes.length
+                });
+
+            }
+
+
+            console.log(
+                `Blocos salvos: ${changes.length} | Mundo: ${worldId}`
+            );
+
+
+        } catch (error) {
+
+            if (client && transactionStarted) {
+
+                try {
+
+                    await client.query("ROLLBACK");
+
+                } catch (rollbackError) {
+
+                    console.error(
+                        "Erro no rollback dos chunks:",
+                        rollbackError
+                    );
+
+                }
+
+            }
+
+
+            sendSocketError(
+                ack,
+                error,
+                "Não foi possível salvar as alterações do mundo."
+            );
+
+
+        } finally {
+
+            client?.release();
+
+        }
+
+    });
+
 
     socket.on("world:create", async (payload = {}, ack) => {
         let client;
