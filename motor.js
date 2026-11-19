@@ -27795,6 +27795,10 @@ class zg {
         this.blockChangeFlushPromise = null;
         this.applyingRemoteBlockChange = false;
         this.remotePlayers = new Map();
+        // Persistência individual dos jogadores.
+        this.pendingPlayerSave = null;
+        this.playerSavePromise = null;
+        this.playerSaveTimer = 5;
 
         this.multiplayerToken = sessionStorage.getItem("patycraft_token");
         this.multiplayerUser = null;
@@ -28499,6 +28503,9 @@ async loadSharedWorld(worldId) {
             saturation: Number.isFinite(Number(playerData.saturation))
                 ? Number(playerData.saturation)
                 : 5,
+            exhaustion: Number.isFinite(Number(playerData.exhaustion))
+                ? Math.max(0, Math.min(1000, Number(playerData.exhaustion)))
+                : 0,
 
             inv: playerData.inv ?? [],
             selected: Number(playerData.selected) || 0,
@@ -28696,7 +28703,161 @@ async loadSharedWorld(worldId) {
             pitch: player.pitch
         }
     });
+    
     }
+
+    
+    updatePlayerPersistence(delta) {
+
+        if (
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            this.state !== "playing" ||
+            !this.multiplayerSocket?.connected ||
+            this.multiplayerWorldId !== this.meta.id
+        ) {
+            return;
+        }
+
+        this.playerSaveTimer -= delta;
+
+        if (this.playerSaveTimer > 0) {
+            return;
+        }
+
+        // Próximo salvamento em 5 segundos.
+        this.playerSaveTimer = 5;
+
+        this.queuePlayerSave();
+    }
+
+
+    queuePlayerSave() {
+
+        if (
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            !this.multiplayerSocket?.connected ||
+            this.multiplayerWorldId !== this.meta.id
+        ) {
+            return false;
+        }
+
+        const captured = this.capturePlayerState();
+
+        if (!captured) {
+            return false;
+        }
+
+        // Mantém somente a captura mais recente.
+        this.pendingPlayerSave = {
+            worldId: this.meta.id,
+            ...captured
+        };
+
+        // Inicia o envio, caso não exista outro em andamento.
+        void this.flushPlayerSave();
+
+        return true;
+    }
+
+
+    async flushPlayerSave() {
+
+        // Evita duas gravações simultâneas.
+        if (this.playerSavePromise) {
+            return this.playerSavePromise;
+        }
+
+        if (!this.pendingPlayerSave) {
+            return true;
+        }
+
+        const pending = this.pendingPlayerSave;
+        const socket = this.multiplayerSocket;
+
+        this.pendingPlayerSave = null;
+
+        if (
+            !socket?.connected ||
+            this.multiplayerWorldId !== pending.worldId
+        ) {
+            this.pendingPlayerSave = pending;
+            return false;
+        }
+
+        const operation = (async () => {
+
+            try {
+
+                await new Promise((resolve, reject) => {
+
+                    socket.timeout(15000).emit(
+                        "player:save",
+                        pending,
+                        (error, response) => {
+
+                            if (error) {
+                                reject(error);
+                                return;
+                            }
+
+                            if (!response?.success) {
+                                reject(
+                                    new Error(
+                                        response?.message ||
+                                        "O servidor não conseguiu salvar o jogador."
+                                    )
+                                );
+                                return;
+                            }
+
+                            resolve(response);
+
+                        }
+                    );
+
+                });
+
+            } catch (error) {
+
+                // Não substitui uma captura mais recente.
+                if (!this.pendingPlayerSave) {
+                    this.pendingPlayerSave = pending;
+                }
+
+                console.error(
+                    "Erro ao salvar estado do jogador:",
+                    error
+                );
+
+                return false;
+
+            } finally {
+
+                this.playerSavePromise = null;
+
+            }
+
+            // Se chegou uma captura nova durante o envio,
+            // salva também o estado mais recente.
+            if (
+                this.pendingPlayerSave &&
+                this.pendingPlayerSave.worldId === pending.worldId
+            ) {
+                return this.flushPlayerSave();
+            }
+
+            return true;
+
+        })();
+
+        this.playerSavePromise = operation;
+
+        return operation;
+    }
+
+
     start() {
         this.startPanorama(),
         this.ui.showMainMenu();
@@ -28943,6 +29104,9 @@ async loadSharedWorld(worldId) {
             r.health = o.health,
             r.hunger = o.hunger,
             r.saturation = o.saturation,
+            r.exhaustion = Number.isFinite(Number(o.exhaustion))
+                ? Math.max(0, Math.min(1000, Number(o.exhaustion)))
+                : 0,
             r.inv.load(o.inv),
             r.inv.selected = Math.max(0, Math.min(8, o.selected | 0)),
             r.spawn.set(...o.spawn),
@@ -29012,6 +29176,7 @@ async loadSharedWorld(worldId) {
         this.ui.showResumeHint(),
         this.ui.showHeldName(((s = t.inv.held) == null ? void 0 : s.id) ?? null),
         this.autosave = 60,
+        this.playerSaveTimer = 5,
         this.joinMultiplayerWorld()
     }
     resume() {
@@ -29063,6 +29228,36 @@ async loadSharedWorld(worldId) {
 
         await this.save(!0);
 
+        // Salva o estado individual antes de sair.
+        if (this.meta?.storage === "shared") {
+
+            const queued = this.queuePlayerSave();
+
+            if (!queued) {
+                this.ui.toast(
+                    "Não foi possível iniciar o salvamento do jogador. Verifique sua conexão."
+                );
+
+                return;
+            }
+
+            const playerSaved = await this.flushPlayerSave();
+
+            if (
+                !playerSaved ||
+                this.pendingPlayerSave
+            ) {
+                this.ui.toast(
+                    "Não foi possível confirmar o salvamento do jogador. Tente novamente."
+                );
+
+                return;
+            }
+        }
+
+        // Mantém o salvamento local original.
+        await this.save(!0);
+
 
         this.input.unlock();
 
@@ -29092,11 +29287,68 @@ async loadSharedWorld(worldId) {
             return
         }
     }
+
+    capturePlayerState() {
+        const player = this.player;
+
+        if (!player) {
+            return null;
+        }
+
+        // Mantém o comportamento de salvamento do jogador morto:
+        // ele será restaurado no ponto de renascimento.
+        const position = player.dead
+            ? player.spawn
+            : player.body.pos;
+
+        return {
+            position: {
+                x: position.x,
+                y: position.y,
+                z: position.z
+            },
+
+            playerData: {
+                // Rotação
+                yaw: player.yaw,
+                pitch: player.pitch,
+
+                // Atributos
+                health: player.dead ? 20 : player.health,
+                hunger: player.dead ? 20 : player.hunger,
+                saturation: player.saturation,
+                exhaustion: player.exhaustion,
+
+                // Inventário
+                inv: player.inv.toJSON(),
+                selected: player.inv.selected,
+
+                // Renascimento
+                spawn: [
+                    player.spawn.x,
+                    player.spawn.y,
+                    player.spawn.z
+                ],
+
+                hasBedSpawn: player.hasBedSpawn,
+
+                // Estado de movimentação
+                flying: player.flying
+            }
+        };
+    }
+
     async save(t) {
         if (!this.world || !this.meta || this.state === "menu" || this.state === "loading")
             return;
         const e = this.player
           , n = {};
+
+        const capturedPlayerState = this.capturePlayerState();
+
+        if (!capturedPlayerState) {
+            return;
+        }
         for (const [a,l] of this.world.mods)
             l.size && (n[a] = [...l.entries()]);
         const s = {};
@@ -29111,19 +29363,11 @@ async loadSharedWorld(worldId) {
             id: this.meta.id,
             version: 1,
             player: {
-                x: e.body.pos.x,
-                y: e.body.pos.y,
-                z: e.body.pos.z,
-                yaw: e.yaw,
-                pitch: e.pitch,
-                health: e.dead ? 20 : e.health,
-                hunger: e.dead ? 20 : e.hunger,
-                saturation: e.saturation,
-                inv: e.inv.toJSON(),
-                selected: e.inv.selected,
-                spawn: [e.spawn.x, e.spawn.y, e.spawn.z],
-                hasBedSpawn: e.hasBedSpawn,
-                flying: e.flying
+                x: capturedPlayerState.position.x,
+                y: capturedPlayerState.position.y,
+                z: capturedPlayerState.position.z,
+
+                ...capturedPlayerState.playerData
             },
             time: this.ticks,
             day: this.day,
@@ -29340,6 +29584,7 @@ async loadSharedWorld(worldId) {
         this.showDebug ? this.ui.setDebug(this.debugText()) : this.ui.setDebug(null),
         r && this.openFurnaceKey && this.ui.containers.refresh(),
         this.updateMultiplayerMovement(t),
+        this.updatePlayerPersistence(t),
         r && this.openFurnaceKey && this.ui.containers.refresh()
     }
     playerEvents() {

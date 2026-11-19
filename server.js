@@ -24,6 +24,10 @@ const MAX_BLOCK_CHANGES_PER_BATCH = 128;
 // Limite das coordenadas do mundo.
 const MAX_WORLD_COORDINATE = 100000;
 
+// Limites para a persistência individual dos jogadores.
+const MAX_PLAYER_DATA_BYTES = 16 * 1024;
+const MAX_INVENTORY_SLOTS = 36;
+
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
@@ -728,6 +732,397 @@ io.on("connection", (socket) => {
         leaveWorld(socket);
     });
     
+
+    // Persistência individual do jogador.
+    socket.on("player:save", async (payload = {}, ack) => {
+
+        let client;
+        let transactionStarted = false;
+
+        try {
+
+            // 1. Valida o formato da requisição.
+
+            if (!isPlainObject(payload)) {
+                throw createRequestError(
+                    "Dados de salvamento inválidos."
+                );
+            }
+
+            const userId = getAuthenticatedUserId(socket);
+            const worldId = payload.worldId;
+
+            if (!isValidWorldId(worldId)) {
+                throw createRequestError(
+                    "Identificador de mundo inválido."
+                );
+            }
+
+
+            // 2. Confirma que o jogador está no mundo.
+            // Impede salvar usando outra sessão ou conta.
+
+            if (socket.data.worldId !== worldId) {
+                throw createRequestError(
+                    "Você não está conectado a este mundo."
+                );
+            }
+
+            const activePlayer = worlds
+                .get(worldId)
+                ?.get(userId);
+
+            if (
+                !activePlayer ||
+                activePlayer.socketId !== socket.id
+            ) {
+                throw createRequestError(
+                    "Sessão de jogador inválida."
+                );
+            }
+
+
+            // 3. Valida a posição.
+
+            const position = payload.position;
+            const playerData = payload.playerData;
+
+            if (
+                !isPlainObject(position) ||
+                !isPlainObject(playerData)
+            ) {
+                throw createRequestError(
+                    "Posição ou estado do jogador inválido."
+                );
+            }
+
+            const { x, y, z } = position;
+
+            if (
+                ![x, y, z].every(Number.isFinite) ||
+                [x, y, z].some(value =>
+                    Math.abs(value) > MAX_WORLD_COORDINATE
+                )
+            ) {
+                throw createRequestError(
+                    "Posição do jogador fora dos limites permitidos."
+                );
+            }
+
+
+            // 4. Valida rotação e atributos.
+
+            const {
+                yaw,
+                pitch,
+                health,
+                hunger,
+                saturation,
+                exhaustion,
+                selected,
+                spawn,
+                hasBedSpawn,
+                flying
+            } = playerData;
+
+            if (
+                !Number.isFinite(yaw) ||
+                Math.abs(yaw) > 100000 ||
+                !Number.isFinite(pitch) ||
+                pitch < -Math.PI / 2 ||
+                pitch > Math.PI / 2
+            ) {
+                throw createRequestError(
+                    "Rotação do jogador inválida."
+                );
+            }
+
+            if (
+                !Number.isFinite(health) ||
+                health < 0 ||
+                health > 20 ||
+
+                !Number.isFinite(hunger) ||
+                hunger < 0 ||
+                hunger > 20 ||
+
+                !Number.isFinite(saturation) ||
+                saturation < 0 ||
+                saturation > 20 ||
+
+                !Number.isFinite(exhaustion) ||
+                exhaustion < 0 ||
+                exhaustion > 1000
+            ) {
+                throw createRequestError(
+                    "Atributos do jogador inválidos."
+                );
+            }
+
+            if (
+                !Number.isSafeInteger(selected) ||
+                selected < 0 ||
+                selected > 8
+            ) {
+                throw createRequestError(
+                    "Slot selecionado inválido."
+                );
+            }
+
+            if (
+                typeof hasBedSpawn !== "boolean" ||
+                typeof flying !== "boolean"
+            ) {
+                throw createRequestError(
+                    "Estado do jogador inválido."
+                );
+            }
+
+
+            // 5. Valida o ponto de renascimento.
+
+            if (
+                !Array.isArray(spawn) ||
+                spawn.length !== 3 ||
+                !spawn.every(Number.isFinite) ||
+                spawn.some(value =>
+                    Math.abs(value) > MAX_WORLD_COORDINATE
+                )
+            ) {
+                throw createRequestError(
+                    "Ponto de renascimento inválido."
+                );
+            }
+
+
+            // 6. Valida e normaliza o inventário.
+
+            const inventory = playerData.inv;
+
+            if (
+                !Array.isArray(inventory) ||
+                inventory.length > MAX_INVENTORY_SLOTS
+            ) {
+                throw createRequestError(
+                    "Inventário inválido."
+                );
+            }
+
+            const safeInventory = inventory.map((item) => {
+
+                if (item === null) {
+                    return null;
+                }
+
+                if (
+                    !isPlainObject(item) ||
+                    !Number.isSafeInteger(item.id) ||
+                    item.id < 0 ||
+                    item.id > 65535 ||
+                    !Number.isSafeInteger(item.count) ||
+                    item.count < 1 ||
+                    item.count > 9999
+                ) {
+                    throw createRequestError(
+                        "Item do inventário inválido."
+                    );
+                }
+
+                if (
+                    item.dmg !== undefined &&
+                    (
+                        !Number.isSafeInteger(item.dmg) ||
+                        item.dmg < 0 ||
+                        item.dmg > 1000000
+                    )
+                ) {
+                    throw createRequestError(
+                        "Durabilidade de item inválida."
+                    );
+                }
+
+                return {
+                    id: item.id,
+                    count: item.count,
+                    ...(item.dmg !== undefined
+                        ? { dmg: item.dmg }
+                        : {})
+                };
+
+            });
+
+
+            // 7. Cria somente os campos permitidos.
+            // Evita armazenar propriedades arbitrárias do cliente.
+
+            const safePlayerData = {
+                yaw,
+                pitch,
+                health,
+                hunger,
+                saturation,
+                exhaustion,
+                inv: safeInventory,
+                selected,
+                spawn: [...spawn],
+                hasBedSpawn,
+                flying
+            };
+
+            const playerDataJson = JSON.stringify(
+                safePlayerData
+            );
+
+            if (
+                Buffer.byteLength(playerDataJson, "utf8") >
+                MAX_PLAYER_DATA_BYTES
+            ) {
+                throw createRequestError(
+                    "Os dados do jogador excedem o tamanho permitido."
+                );
+            }
+
+
+            // 8. Inicia uma transação PostgreSQL.
+
+            client = await pool.connect();
+
+            await client.query("BEGIN");
+
+            transactionStarted = true;
+
+
+            // 9. Confirma novamente a autorização.
+            // Utiliza a mesma regra do salvamento dos blocos.
+
+            const accessResult = await client.query(
+                `
+                SELECT w.id
+
+                FROM worlds w
+
+                WHERE
+                    w.id = $1
+
+                    AND (
+                        w.owner_id = $2
+
+                        OR w.visibility = 'public'
+
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+
+                FOR SHARE OF w
+                `,
+                [worldId, userId]
+            );
+
+            if (accessResult.rows.length === 0) {
+                throw createRequestError(
+                    "Você não possui autorização para salvar neste mundo."
+                );
+            }
+
+
+            // 10. Insere ou atualiza o estado individual.
+            // A chave composta identifica um jogador em um mundo.
+
+            const saveResult = await client.query(
+                `
+                INSERT INTO player_world_states (
+                    world_id,
+                    user_id,
+                    position_x,
+                    position_y,
+                    position_z,
+                    player_data,
+                    updated_at
+                )
+
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6::jsonb,
+                    NOW()
+                )
+
+                ON CONFLICT (world_id, user_id)
+
+                DO UPDATE SET
+                    position_x = EXCLUDED.position_x,
+                    position_y = EXCLUDED.position_y,
+                    position_z = EXCLUDED.position_z,
+                    player_data = EXCLUDED.player_data,
+                    updated_at = NOW()
+
+                RETURNING updated_at
+                `,
+                [
+                    worldId,
+                    userId,
+                    x,
+                    y,
+                    z,
+                    playerDataJson
+                ]
+            );
+
+
+            // 11. Confirma a gravação.
+
+            await client.query("COMMIT");
+
+            transactionStarted = false;
+
+
+            // 12. Responde somente depois do COMMIT.
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    updatedAt: saveResult.rows[0].updated_at
+                });
+            }
+
+        } catch (error) {
+
+            // Desfaz qualquer operação incompleta.
+
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback do jogador:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendSocketError(
+                ack,
+                error,
+                "Não foi possível salvar o estado do jogador."
+            );
+
+        } finally {
+
+            client?.release();
+
+        }
+
+    });
+
 
     socket.on("world:blocks:change", async (payload = {}, ack) => {
 
