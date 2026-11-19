@@ -26920,7 +26920,7 @@ function Fg(i) {
     } catch {}
 }
 const Ps = ["Pacífico", "Fácil", "Normal", "Difícil"]
-  , pc = ["Feito por IA!", "Agora com Patricias!", "100% patricial!", "Quem é essse breninho?", "Nenel ama dinossauros", "Luiz sai de casa", "Cuidado com a Selma!", "Fuja do Jack!", "PatyBL passou aqui", "Já pisou na grama hoje?", "Beba Agua", "Esse que é seu Namorado amiga?", "Olha o Mickey ali!", "Experimente tambem terraria!"];
+  , pc = ["Feito por IA!", "Agora com Patricias!", "100% patricial!", "Quem é essse breninho?", "Nenel ama dinossauros", "Luiz sai de casa", "Passos rei valete", "Cuidado com a Selma cururu!", "Fuja do Jack!", "Jack > Enaldinho", "PatyBL passou aqui", "Já pisou na grama hoje?", "Beba Agua", "Esse que é seu Namorado amiga?", "Olha o Mickey ali!", "Experimente tambem terraria!", "SOLTA O GATO!", "Não Sobra nada!", "AAAAAIIIII!", "Negrino sem teto", "SOLTA O MEU GOGÓ!!!", "Linguini do Ódio", "new boss maura!", "E-N-A-L-D-I-D-Y, E-N-A-L-J-A-C-K"];
 class kg {
     constructor(t, e, n) {
         this.hooks = t,
@@ -28893,7 +28893,25 @@ async loadSharedWorld(worldId) {
         this.world.fancy = this.settings.quality === "fancy",
         this.world.smooth = this.settings.smoothLighting,
         this.scene.add(this.world.group),
-        this.world.onBlockChanged = (o, a, l, c, h) => this.onBlockChanged(o, a, l, c, h),
+        this.world.onBlockChanged = (
+            x,
+            y,
+            z,
+            oldBlock,
+            newBlock,
+            oldMeta,
+            newMeta,
+            persistent
+        ) => this.onBlockChanged(
+            x,
+            y,
+            z,
+            oldBlock,
+            newBlock,
+            oldMeta,
+            newMeta,
+            persistent
+        ),
         e) {
             for (const [o,a] of Object.entries(e.chests ?? {}))
                 Array.isArray(a) && this.chests.set(o, Array.from({
