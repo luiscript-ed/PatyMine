@@ -26341,6 +26341,8 @@ class Ig {
         this.kind = t,
         this.player = e,
         this.furnace = (n == null ? void 0 : n.furnace) ?? null,
+        this.furnaceKey =
+            (n == null ? void 0 : n.furnaceKey) ?? null,
         this.chest = (n == null ? void 0 : n.chest) ?? null,
         this.chestKey =
             (n == null ? void 0 : n.chestKey) ?? null,
@@ -26371,6 +26373,8 @@ class Ig {
         this.kind = null,
         this.chestKey = null,
         this.chest = null,
+        this.furnaceKey = null,
+        this.furnace = null,
         this.el.classList.add("hidden"),
         this.el.innerHTML = "",
         this.cursorEl.classList.add("hidden"),
@@ -26710,12 +26714,34 @@ class Ig {
         );
     }
 
+
+    notifyFurnaceChanged(previousSnapshot) {
+
+        if (
+            this.kind !== "furnace" ||
+            !this.furnaceKey ||
+            !this.furnace ||
+            JSON.stringify(this.furnace) === previousSnapshot
+        ) {
+            return;
+        }
+
+        this.host.onFurnaceChanged?.(
+            this.furnaceKey,
+            this.furnace
+        );
+    }
+
     click(t, e, n) {
         const s = this.refs[t]
           , r = s.get();
           const chestSnapshot =
             this.kind === "chest" && this.chest
                 ? JSON.stringify(this.chest)
+                : null;
+        const furnaceSnapshot =
+            this.kind === "furnace" && this.furnace
+                ? JSON.stringify(this.furnace)
                 : null;
         if (s.section === "palette") {
             this.cursor ? this.cursor = null : r && (n ? this.player.inv.add({
@@ -26762,12 +26788,15 @@ class Ig {
                 r.count <= 0 && s.set(null)
             }
             this.refresh();
+            this.notifyChestChanged(chestSnapshot);
+            this.notifyFurnaceChanged(furnaceSnapshot);
             return
         }
         if (n && r) {
             this.quickMove(s, r),
             this.refresh(),
-            this.notifyChestChanged(chestSnapshot);
+            this.notifyChestChanged(chestSnapshot),
+            this.notifyFurnaceChanged(furnaceSnapshot);
             return
         }
         const o = this.cursor;
@@ -26805,6 +26834,7 @@ class Ig {
                 o.count <= 0 && (this.cursor = null));
         this.refresh()
         this.notifyChestChanged(chestSnapshot);
+        this.notifyFurnaceChanged(furnaceSnapshot);
     }
     quickMove(t, e) {
         this.player.inv;
@@ -27875,6 +27905,8 @@ class zg {
         this.blockEntitySaveBlocked = new Set,
         this.pendingBlockEntityOperations = new Set,
         this.furnaces = new Map,
+        this.furnacePersistedSnapshots = new Map,
+        this.furnaceSaveTimer = 0,
         this.saplings = new Map,
         this.elapsed = 0,
         this.last = performance.now(),
@@ -27988,6 +28020,8 @@ class zg {
             onCraft: () => Zt.play("craft"),
             onChestInventoryChanged: (key, inventory) =>
                 this.queueChestInventorySave(key, inventory),
+            onFurnaceChanged: (key, furnace) =>
+                this.queueFurnaceStateSave(key, furnace),
         }),
         this.ui.containers.onClose = () => {
             this.openFurnaceKey = null,
@@ -28581,6 +28615,58 @@ async loadSharedWorld(worldId) {
         }
 
         // Validação específica dos baús.
+
+        if (entity.entity_type === "furnace") {
+
+            const data = entity.data;
+
+            const validItem = item =>
+                item === null ||
+                (
+                    item !== undefined &&
+                    typeof item === "object" &&
+                    !Array.isArray(item) &&
+                    Number.isSafeInteger(item.id) &&
+                    item.id >= 0 &&
+                    item.id <= 65535 &&
+                    Number.isSafeInteger(item.count) &&
+                    item.count >= 1 &&
+                    item.count <= 9999 &&
+                    (
+                        item.dmg === undefined ||
+                        (
+                            Number.isSafeInteger(item.dmg) &&
+                            item.dmg >= 0 &&
+                            item.dmg <= 1000000
+                        )
+                    )
+                );
+
+            const progress = [
+                data.burn,
+                data.burnMax,
+                data.cook
+            ];
+
+            if (
+                dataVersion !== 1 ||
+
+                !["input", "fuel", "output"].every(
+                    field => validItem(data[field])
+                ) ||
+
+                !progress.every(value =>
+                    Number.isFinite(value) &&
+                    value >= 0 &&
+                    value <= 1000000
+                )
+            ) {
+                throw new Error(
+                    "Dados da fornalha retornados pelo servidor são inválidos."
+                );
+            }
+        }
+
         if (
             entity.entity_type === "chest" &&
             (
@@ -29068,6 +29154,8 @@ async loadSharedWorld(worldId) {
         this.pendingBlockEntityOperations.clear(),
 
         this.furnaces.clear(),
+        this.furnacePersistedSnapshots.clear(),
+        this.furnaceSaveTimer = 0,
         this.saplings.clear(),
         this.mining = null
     }
@@ -29222,22 +29310,20 @@ async loadSharedWorld(worldId) {
             // Os dados novos prevalecem sobre os dados legados
             // quando representam a mesma coordenada.
 
+            
             for (const entity of e.blockEntities ?? []) {
 
                 const x = Number(entity.x);
                 const y = Number(entity.y);
                 const z = Number(entity.z);
-
                 const revision = Number(entity.revision);
 
                 if (
                     ![x, y, z, revision].every(Number.isSafeInteger) ||
-
                     Math.abs(x) > 100000 ||
                     y < 0 ||
                     y >= Wt ||
                     Math.abs(z) > 100000 ||
-
                     revision < 1
                 ) {
                     continue;
@@ -29245,52 +29331,91 @@ async loadSharedWorld(worldId) {
 
                 const key = Cs(x, y, z);
 
-                // Registra a revisão da estrutura.
-                this.blockEntityRevisions.set(key, revision);
+                // Restauração dos baús.
+                if (entity.entity_type === "chest") {
 
-                // Nesta etapa, integramos somente os baús.
-                if (entity.entity_type !== "chest") {
-                    this.chests.delete(key);
+                    if (
+                        Number(entity.data_version) !== 1 ||
+                        !Array.isArray(entity.data?.inventory) ||
+                        entity.data.inventory.length !== 27
+                    ) {
+                        continue;
+                    }
+
+                    const inventory = entity.data.inventory.map(
+                        item => br(item)
+                    );
+
+                    const currentInventory = this.chests.get(key);
+
+                    if (currentInventory) {
+                        currentInventory.splice(
+                            0,
+                            currentInventory.length,
+                            ...inventory
+                        );
+                    } else {
+                        this.chests.set(key, inventory);
+                    }
+
+                    this.blockEntityRevisions.set(key, revision);
+
                     continue;
                 }
 
-                if (
-                    Number(entity.data_version) !== 1 ||
-                    !entity.data ||
-                    !Array.isArray(entity.data.inventory) ||
-                    entity.data.inventory.length !== 27
-                ) {
-                    console.warn(
-                        "Dados de baú incompatíveis:",
-                        key
+                // Restauração das fornalhas.
+                if (entity.entity_type === "furnace") {
+
+                    const data = entity.data;
+
+                    if (
+                        Number(entity.data_version) !== 1 ||
+                        !data ||
+                        typeof data !== "object"
+                    ) {
+                        continue;
+                    }
+
+                    const furnace = {
+                        input: br(data.input),
+                        fuel: br(data.fuel),
+                        output: br(data.output),
+
+                        burn: Number(data.burn),
+                        burnMax: Number(data.burnMax),
+                        cook: Number(data.cook)
+                    };
+
+                    if (
+                        ![
+                            furnace.burn,
+                            furnace.burnMax,
+                            furnace.cook
+                        ].every(value =>
+                            Number.isFinite(value) &&
+                            value >= 0 &&
+                            value <= 1000000
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    this.furnaces.set(key, furnace);
+
+                    this.blockEntityRevisions.set(key, revision);
+
+                    this.furnacePersistedSnapshots.set(
+                        key,
+                        JSON.stringify(furnace)
                     );
-
-                    continue;
-                }
-
-                // Reconstrói os itens usando o normalizador original.
-                const inventory = entity.data.inventory.map(
-                    item => br(item)
-                );
-
-                const currentInventory = this.chests.get(key);
-
-                if (currentInventory) {
-
-                    currentInventory.splice(
-                        0,
-                        currentInventory.length,
-                        ...inventory
-                    );
-
-                } else {
-
-                    this.chests.set(key, inventory);
-
                 }
             }
 
+
             for (const [o,a] of Object.entries(e.furnaces ?? {})) {
+                if (this.blockEntityRevisions.has(o)) {
+                    continue;
+                }
                 const l = a;
                 l && typeof l == "object" && this.furnaces.set(o, {
                     input: br(l.input),
@@ -30028,7 +30153,27 @@ async loadSharedWorld(worldId) {
 
                 return;
             }
-        if (l === M.CHEST && blockEntityResolved) {
+
+        if (
+            l === M.FURNACE &&
+            this.meta?.storage === "shared" &&
+            !blockEntityResolved
+        ) {
+            void this.breakSharedFurnace(
+                t,
+                e,
+                n,
+                s,
+                r,
+                o
+            );
+
+            return;
+        }
+        if (
+            (l === M.CHEST || l === M.FURNACE) &&
+            blockEntityResolved
+            ) {
             const wasApplyingRemote = this.applyingRemoteBlockChange;
             this.applyingRemoteBlockChange = true;
             a.setBlock(t, e, n, M.AIR, 0, !0, o);
@@ -30177,6 +30322,18 @@ async loadSharedWorld(worldId) {
 
             return true;
         }
+        if (e === M.FURNACE && this.meta?.storage === "shared") {
+
+            void this.placeSharedFurnace(
+                r,
+                o,
+                a,
+                u,
+                c.sound
+            );
+
+            return true;
+        }
 
         if (e === M.OAK_DOOR) {
             const g = n.getBlock(r, o + 1, a);
@@ -30224,12 +30381,18 @@ async loadSharedWorld(worldId) {
             return l("crafting"),
             !0;
         case M.FURNACE:
-            return this.furnaces.has(o) || this.furnaces.set(o, hc()),
-            this.openFurnaceKey = o,
-            l("furnace", {
-                furnace: this.furnaces.get(o)
-            }),
-            !0;
+        if (this.meta?.storage === "shared") {
+            void this.openSharedFurnace(t, e, n);
+            return true;
+        }
+        if (!this.furnaces.has(o)) {
+            this.furnaces.set(o, hc());
+        }
+        this.openFurnaceKey = o;
+        l("furnace", { furnace: this.furnaces.get(o) });
+        return true;
+
+            
         case M.CHEST:
             if (this.meta?.storage === "shared") {
 
@@ -30831,6 +30994,75 @@ async loadSharedWorld(worldId) {
             return;
         }
 
+        if (entity.entity_type === "furnace") {
+
+            const data = entity.data;
+
+            if (
+                dataVersion !== 1 ||
+                !data ||
+                !["burn", "burnMax", "cook"].every(field =>
+                    Number.isFinite(data[field]) &&
+                    data[field] >= 0 &&
+                    data[field] <= 1000000
+                )
+            ) {
+                console.warn(
+                    "Atualização remota de fornalha inválida:",
+                    key
+                );
+
+                return;
+            }
+
+            const updatedFurnace = {
+                input: br(data.input),
+                fuel: br(data.fuel),
+                output: br(data.output),
+
+                burn: data.burn,
+                burnMax: data.burnMax,
+                cook: data.cook
+            };
+
+            this.chests.delete(key);
+
+            let currentFurnace = this.furnaces.get(key);
+
+            if (currentFurnace) {
+
+                Object.assign(
+                    currentFurnace,
+                    updatedFurnace
+                );
+
+            } else {
+
+                currentFurnace = updatedFurnace;
+
+                this.furnaces.set(
+                    key,
+                    currentFurnace
+                );
+            }
+
+            this.blockEntityRevisions.set(key, revision);
+
+            this.furnacePersistedSnapshots.set(
+                key,
+                JSON.stringify(updatedFurnace)
+            );
+
+            if (
+                this.ui?.containers?.kind === "furnace" &&
+                this.ui.containers.furnace === currentFurnace
+            ) {
+                this.ui.containers.refresh();
+            }
+
+            return;
+        }
+
         // Guarda a revisão de tipos ainda não integrados ao motor.
         this.blockEntityRevisions.set(key, revision);
 
@@ -30900,10 +31132,15 @@ async loadSharedWorld(worldId) {
         }
 
         const previousInventory = this.chests.get(key);
+        const previousFurnace = this.furnaces.get(key);
 
         this.chests.delete(key);
+        this.furnaces.delete(key);
 
         this.blockEntityRevisions.delete(key);
+        this.furnacePersistedSnapshots.delete(key);
+
+        this.blockEntitySaveBlocked.delete(key);
 
         // Fecha a interface caso o jogador esteja utilizando
         // exatamente o baú que acabou de ser removido.
@@ -30916,6 +31153,18 @@ async loadSharedWorld(worldId) {
 
             this.ui.toast(
                 "Este baú foi removido por outro jogador."
+            );
+        }
+
+        if (
+            previousFurnace &&
+            this.ui?.containers?.kind === "furnace" &&
+            this.ui.containers.furnace === previousFurnace
+        ) {
+            this.ui.containers.close();
+
+            this.ui.toast(
+                "Esta fornalha foi removida por outro jogador."
             );
         }
     }
@@ -31735,6 +31984,783 @@ async loadSharedWorld(worldId) {
     }
 
 
+    async ensureSharedFurnaceEntity(x, y, z) {
+
+        const worldId = this.meta?.id;
+        const key = Cs(x, y, z);
+
+        if (
+            !worldId ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId
+        ) {
+            throw new Error(
+                "O mundo compartilhado não está conectado."
+            );
+        }
+
+        const revision = this.blockEntityRevisions.get(key);
+        const currentFurnace = this.furnaces.get(key);
+
+        if (
+            Number.isSafeInteger(revision) &&
+            revision >= 1 &&
+            currentFurnace
+        ) {
+            return currentFurnace;
+        }
+
+        // Recupera os dados legados, quando disponíveis.
+        const legacyFurnace = currentFurnace
+            ? {
+                input: currentFurnace.input
+                    ? { ...currentFurnace.input }
+                    : null,
+
+                fuel: currentFurnace.fuel
+                    ? { ...currentFurnace.fuel }
+                    : null,
+
+                output: currentFurnace.output
+                    ? { ...currentFurnace.output }
+                    : null,
+
+                burn: Number(currentFurnace.burn) || 0,
+                burnMax: Number(currentFurnace.burnMax) || 0,
+                cook: Number(currentFurnace.cook) || 0
+            }
+            : hc();
+
+        const meta = this.world.getMeta(x, y, z);
+
+        let entity = null;
+
+        try {
+
+            const response = await this.requestWorldEvent(
+                "world:block-entity:create",
+                {
+                    worldId,
+
+                    position: { x, y, z },
+
+                    entityType: "furnace",
+
+                    meta,
+
+                    migration: true,
+
+                    initialData: legacyFurnace
+                }
+            );
+
+            entity = response.entity;
+
+        } catch (error) {
+
+            if (
+                error.code === "ALREADY_EXISTS" &&
+                error.currentEntity
+            ) {
+
+                entity = error.currentEntity;
+
+            } else if (error.uncertain) {
+
+                const loaded = await this.requestWorldEvent(
+                    "world:load",
+                    { worldId }
+                );
+
+                entity = loaded.blockEntities?.find(item =>
+                    item.x === x &&
+                    item.y === y &&
+                    item.z === z &&
+                    item.entity_type === "furnace"
+                ) ?? null;
+
+            } else {
+
+                throw error;
+
+            }
+        }
+
+        if (
+            !entity ||
+            entity.entity_type !== "furnace" ||
+            !entity.data ||
+            !Number.isSafeInteger(Number(entity.revision))
+        ) {
+            throw new Error(
+                "Não foi possível recuperar os dados da fornalha."
+            );
+        }
+
+        if (this.meta?.id !== worldId) {
+            return null;
+        }
+
+        this.applyRemoteBlockEntity({
+            worldId,
+            entity
+        });
+
+        return this.furnaces.get(key);
+    }
+
+
+    async openSharedFurnace(x, y, z) {
+
+        const worldId = this.meta?.id;
+        const key = Cs(x, y, z);
+
+        const operationKey = `${worldId}:${key}`;
+
+        if (this.pendingBlockEntityOperations.has(operationKey)) {
+            return;
+        }
+
+        this.pendingBlockEntityOperations.add(operationKey);
+
+        try {
+
+            const furnace = await this.ensureSharedFurnaceEntity(
+                x,
+                y,
+                z
+            );
+
+            if (!furnace || this.meta?.id !== worldId) {
+                return;
+            }
+
+            this.blockEntitySaveBlocked.delete(key);
+
+            this.openFurnaceKey = key;
+            this.mining = null;
+
+            this.ui.containers.openWindow(
+                "furnace",
+                this.player,
+                {
+                    furnace,
+                    furnaceKey: key
+                }
+            );
+
+            this.input.unlock();
+
+        } catch (error) {
+
+            console.error(
+                "Erro ao abrir fornalha compartilhada:",
+                error
+            );
+
+            this.ui.toast(
+                error.message ||
+                "Não foi possível abrir a fornalha."
+            );
+
+        } finally {
+
+            this.pendingBlockEntityOperations.delete(
+                operationKey
+            );
+
+        }
+    }
+
+
+    queueFurnaceStateSave(key, furnace) {
+
+        if (
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            !this.multiplayerWorldId ||
+            !furnace ||
+            this.blockEntitySaveBlocked.has(key) ||
+            this.blockEntitySaveQueues.has(key)
+        ) {
+            return;
+        }
+
+        const worldId = this.meta.id;
+
+        const [x, y, z] = key.split(",").map(Number);
+
+        if (![x, y, z].every(Number.isSafeInteger)) {
+            return;
+        }
+
+        const expectedRevision =
+            this.blockEntityRevisions.get(key);
+
+        if (
+            !Number.isSafeInteger(expectedRevision) ||
+            expectedRevision < 1
+        ) {
+            return;
+        }
+
+        const snapshot = {
+            input: furnace.input ? { ...furnace.input } : null,
+            fuel: furnace.fuel ? { ...furnace.fuel } : null,
+            output: furnace.output ? { ...furnace.output } : null,
+
+            burn: Number(furnace.burn),
+            burnMax: Number(furnace.burnMax),
+            cook: Number(furnace.cook)
+        };
+
+        if (
+            ![
+                snapshot.burn,
+                snapshot.burnMax,
+                snapshot.cook
+            ].every(value =>
+                Number.isFinite(value) &&
+                value >= 0 &&
+                value <= 1000000
+            )
+        ) {
+            return;
+        }
+
+        const signature = JSON.stringify(snapshot);
+
+        if (
+            signature ===
+            this.furnacePersistedSnapshots.get(key)
+        ) {
+            return;
+        }
+
+        const task = (async () => {
+
+            try {
+
+                const response = await this.requestWorldEvent(
+                    "world:block-entity:update",
+                    {
+                        worldId,
+
+                        position: { x, y, z },
+
+                        expectedRevision,
+
+                        operation: {
+                            type: "state:replace",
+                            state: snapshot
+                        }
+                    }
+                );
+
+                if (this.meta?.id !== worldId) {
+                    return;
+                }
+
+                const acknowledgedRevision =
+                    Number(response.entity?.revision);
+
+                if (
+                    !Number.isSafeInteger(acknowledgedRevision)
+                ) {
+                    throw new Error(
+                        "O servidor retornou uma revisão inválida."
+                    );
+                }
+
+                const knownRevision =
+                    this.blockEntityRevisions.get(key);
+
+                if (
+                    knownRevision === expectedRevision ||
+                    knownRevision === undefined ||
+                    acknowledgedRevision >= knownRevision
+                ) {
+
+                    this.blockEntityRevisions.set(
+                        key,
+                        acknowledgedRevision
+                    );
+
+                    this.furnacePersistedSnapshots.set(
+                        key,
+                        JSON.stringify(response.entity.data)
+                    );
+                }
+
+            } catch (error) {
+
+                if (this.meta?.id !== worldId) {
+                    return;
+                }
+
+                if (
+                    error.code === "REVISION_CONFLICT" &&
+                    error.currentEntity
+                ) {
+
+                    this.applyRemoteBlockEntity({
+                        worldId,
+                        entity: error.currentEntity
+                    });
+
+                    if (
+                        this.openFurnaceKey === key
+                    ) {
+                        this.ui.toast(
+                            "Outro jogador modificou esta fornalha. O estado atual foi recuperado."
+                        );
+                    }
+
+                    return;
+                }
+
+                this.blockEntitySaveBlocked.add(key);
+
+                console.error(
+                    "Erro ao salvar fornalha:",
+                    error
+                );
+
+                this.ui.toast(
+                    error.message ||
+                    "Não foi possível salvar a fornalha."
+                );
+
+            } finally {
+
+                if (
+                    this.blockEntitySaveQueues.get(key) === task
+                ) {
+                    this.blockEntitySaveQueues.delete(key);
+                }
+
+            }
+
+        })();
+
+        this.blockEntitySaveQueues.set(key, task);
+    }
+
+
+async placeSharedFurnace(x, y, z, meta, sound) {
+
+    const worldId = this.meta?.id;
+    const key = Cs(x, y, z);
+
+    const operationKey = `${worldId}:${key}`;
+
+    if (
+        !worldId ||
+        this.meta.storage !== "shared" ||
+        this.multiplayerWorldId !== worldId ||
+        this.pendingBlockEntityOperations.has(operationKey)
+    ) {
+        return false;
+    }
+
+    const player = this.player;
+    const inventory = player.inv;
+    const selectedSlot = inventory.selected;
+    const held = inventory.slots[selectedSlot];
+
+    if (!held || held.id !== M.FURNACE || held.count < 1) {
+        return false;
+    }
+
+    const reservedItem = player.mode === "survival"
+        ? { ...held, count: 1 }
+        : null;
+
+    if (reservedItem) {
+        held.count--;
+
+        if (held.count <= 0) {
+            inventory.slots[selectedSlot] = null;
+        }
+    }
+
+    this.pendingBlockEntityOperations.add(operationKey);
+
+    const refund = () => {
+
+        if (!reservedItem || this.player !== player) {
+            return;
+        }
+
+        const remaining = player.inv.add(reservedItem);
+
+        if (remaining > 0) {
+            this.dropStack({
+                ...reservedItem,
+                count: remaining
+            });
+        }
+    };
+
+    try {
+
+        const response = await this.requestWorldEvent(
+            "world:block-entity:create",
+            {
+                worldId,
+                position: { x, y, z },
+                entityType: "furnace",
+                meta
+            }
+        );
+
+        if (this.meta?.id !== worldId) {
+            return true;
+        }
+
+        // Aplica a alteração física sem retransmitir ao servidor.
+        this.applyRemoteBlockChanges({
+            worldId,
+            changes: [{
+                x,
+                y,
+                z,
+                blockId: M.FURNACE,
+                meta
+            }]
+        });
+
+        this.applyRemoteBlockEntity({
+            worldId,
+            entity: response.entity
+        });
+
+        Zt.blockSound(sound, "place", {
+            x: x + .5,
+            y: y + .5,
+            z: z + .5
+        });
+
+        return true;
+
+    } catch (error) {
+
+        let existingEntity = error.currentEntity ?? null;
+        let uncertainCreation = false;
+
+        if (error.uncertain) {
+
+            uncertainCreation = true;
+
+            try {
+
+                const loaded = await this.requestWorldEvent(
+                    "world:load",
+                    { worldId }
+                );
+
+                existingEntity = loaded.blockEntities?.find(entity =>
+                    entity.x === x &&
+                    entity.y === y &&
+                    entity.z === z &&
+                    entity.entity_type === "furnace"
+                ) ?? null;
+
+            } catch {}
+
+        }
+
+        if (
+            existingEntity?.entity_type === "furnace" &&
+            existingEntity.data
+        ) {
+
+            if (uncertainCreation) {
+                this.applyRemoteBlockChanges({
+                    worldId,
+                    changes: [{
+                        x,
+                        y,
+                        z,
+                        blockId: M.FURNACE,
+                        meta
+                    }]
+                });
+            }
+
+            this.applyRemoteBlockEntity({
+                worldId,
+                entity: existingEntity
+            });
+
+            if (!uncertainCreation) {
+                refund();
+            }
+
+        } else {
+
+            refund();
+
+        }
+
+        console.error(
+            "Erro ao colocar fornalha compartilhada:",
+            error
+        );
+
+        this.ui.toast(
+            error.message ||
+            "Não foi possível colocar a fornalha."
+        );
+
+        return false;
+
+    } finally {
+
+        this.pendingBlockEntityOperations.delete(
+            operationKey
+        );
+
+    }
+}
+
+
+async breakSharedFurnace(
+    x,
+    y,
+    z,
+    canHarvest,
+    instant,
+    remesh
+) {
+
+    const worldId = this.meta?.id;
+    const key = Cs(x, y, z);
+
+    const operationKey = `${worldId}:${key}`;
+
+    if (
+        !worldId ||
+        this.pendingBlockEntityOperations.has(operationKey)
+    ) {
+        return;
+    }
+
+    this.pendingBlockEntityOperations.add(operationKey);
+
+    const localState = this.furnaces.get(key)
+        ? JSON.parse(JSON.stringify(this.furnaces.get(key)))
+        : hc();
+
+    try {
+
+        // Espera terminar uma gravação pendente.
+        const pendingSave =
+            this.blockEntitySaveQueues.get(key);
+
+        if (pendingSave) {
+            await pendingSave;
+        }
+
+        const furnace = await this.ensureSharedFurnaceEntity(
+            x,
+            y,
+            z
+        );
+
+        if (!furnace || this.meta?.id !== worldId) {
+            return;
+        }
+
+        const expectedRevision =
+            this.blockEntityRevisions.get(key);
+
+        const response = await this.requestWorldEvent(
+            "world:block-entity:remove",
+            {
+                worldId,
+                position: { x, y, z },
+                expectedRevision
+            }
+        );
+
+        const removedData = response.entity?.data;
+
+        if (
+            !removedData ||
+            this.meta?.id !== worldId
+        ) {
+            throw new Error(
+                "O servidor não retornou o estado da fornalha removida."
+            );
+        }
+
+        // Recupera o estado definitivo antes dos drops.
+        this.furnaces.set(key, {
+            input: br(removedData.input),
+            fuel: br(removedData.fuel),
+            output: br(removedData.output),
+
+            burn: Number(removedData.burn),
+            burnMax: Number(removedData.burnMax),
+            cook: Number(removedData.cook)
+        });
+
+        this.blockEntityRevisions.delete(key);
+        this.furnacePersistedSnapshots.delete(key);
+        this.blockEntitySaveBlocked.delete(key);
+
+        if (
+            this.openFurnaceKey === key &&
+            this.ui.containers.kind === "furnace"
+        ) {
+            this.ui.containers.close();
+        }
+
+        // Executa os drops originais do motor.
+        // O servidor já gravou AIR no chunk.
+        this.breakBlock(
+            x,
+            y,
+            z,
+            canHarvest,
+            instant,
+            remesh,
+            true
+        );
+
+    } catch (error) {
+
+        if (
+            error.code === "REVISION_CONFLICT" &&
+            error.currentEntity
+        ) {
+
+            this.applyRemoteBlockEntity({
+                worldId,
+                entity: error.currentEntity
+            });
+
+            this.ui.toast(
+                "Outro jogador modificou a fornalha. Os dados foram atualizados; tente novamente."
+            );
+
+        } else if (error.uncertain) {
+
+            // Confere se a remoção realmente foi confirmada.
+            try {
+
+                const loaded = await this.requestWorldEvent(
+                    "world:load",
+                    { worldId }
+                );
+
+                const entityStillExists =
+                    loaded.blockEntities?.some(entity =>
+                        entity.x === x &&
+                        entity.y === y &&
+                        entity.z === z
+                    );
+
+                const chunkX = Math.floor(x / 16);
+                const chunkZ = Math.floor(z / 16);
+
+                const index =
+                    (x - chunkX * 16) +
+                    (z - chunkZ * 16) * 16 +
+                    y * 256;
+
+                const chunk = loaded.chunks?.find(item =>
+                    Number(item.chunk_x) === chunkX &&
+                    Number(item.chunk_y ?? 0) === 0 &&
+                    Number(item.chunk_z) === chunkZ
+                );
+
+                const savedBlock = chunk?.chunk_data?.find(
+                    entry =>
+                        Array.isArray(entry) &&
+                        entry[0] === index
+                );
+
+                const removalConfirmed =
+                    !entityStillExists &&
+                    Array.isArray(savedBlock) &&
+                    (savedBlock[1] & 255) === 0;
+
+                if (
+                    removalConfirmed &&
+                    this.meta?.id === worldId
+                ) {
+
+                    this.furnaces.set(key, localState);
+
+                    this.blockEntityRevisions.delete(key);
+                    this.furnacePersistedSnapshots.delete(key);
+
+                    this.breakBlock(
+                        x,
+                        y,
+                        z,
+                        canHarvest,
+                        instant,
+                        remesh,
+                        true
+                    );
+
+                    return;
+                }
+
+                const currentEntity =
+                    loaded.blockEntities?.find(entity =>
+                        entity.x === x &&
+                        entity.y === y &&
+                        entity.z === z
+                    );
+
+                if (currentEntity) {
+                    this.applyRemoteBlockEntity({
+                        worldId,
+                        entity: currentEntity
+                    });
+                }
+
+            } catch (reconcileError) {
+
+                console.error(
+                    "Falha ao reconciliar a fornalha:",
+                    reconcileError
+                );
+
+            }
+
+            this.ui.toast(
+                "Não foi possível confirmar a quebra. Confira o estado do mundo antes de tentar novamente."
+            );
+
+        } else {
+
+            console.error(
+                "Erro ao quebrar fornalha:",
+                error
+            );
+
+            this.ui.toast(
+                error.message ||
+                "Não foi possível quebrar a fornalha."
+            );
+
+        }
+
+    } finally {
+
+        this.pendingBlockEntityOperations.delete(
+            operationKey
+        );
+
+    }
+}
+
+
     tickBlockEntities(t) {
         const e = this.world;
         this.furnaceFxT -= t;
@@ -31760,6 +32786,37 @@ async loadSharedWorld(worldId) {
                 Math.random() < .4 && this.particles.smoke(o + .5, a + 1.05, l + .5)
             }
         }
+
+        // Persistência periódica do progresso das fornalhas.
+        this.furnaceSaveTimer -= t;
+
+        if (this.furnaceSaveTimer <= 0) {
+
+            this.furnaceSaveTimer = 2;
+
+            if (
+                this.meta?.storage === "shared" &&
+                this.multiplayerWorldId === this.meta.id
+            ) {
+
+                for (const [key, furnace] of this.furnaces) {
+
+                    if (
+                        !this.blockEntityRevisions.has(key) ||
+                        this.blockEntitySaveBlocked.has(key) ||
+                        this.blockEntitySaveQueues.has(key)
+                    ) {
+                        continue;
+                    }
+
+                    this.queueFurnaceStateSave(
+                        key,
+                        furnace
+                    );
+                }
+            }
+        }
+
         if (n) {
             const s = this.player.body.pos;
             for (let r = 0; r < 6; r++) {

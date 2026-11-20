@@ -648,6 +648,7 @@ BlockEntityRegistry.register("chest", {
 // Fornalha: inventários e progresso seguem os campos já usados por Dg().
 BlockEntityRegistry.register("furnace", {
     dataVersion: 1,
+    blockId: 33,
 
     createDefault() {
         return {
@@ -733,6 +734,27 @@ BlockEntityRegistry.register("furnace", {
             }
 
             return next;
+        }
+
+        if (operation.type === "state:replace") {
+
+            if (!isPlainObject(operation.state)) {
+                throw createBlockEntityError(
+                    "Estado da fornalha inválido."
+                );
+            }
+
+            const state = operation.state;
+
+            return {
+                input: normalizeBlockEntityItem(state.input),
+                fuel: normalizeBlockEntityItem(state.fuel),
+                output: normalizeBlockEntityItem(state.output),
+
+                burn: state.burn,
+                burnMax: state.burnMax,
+                cook: state.cook
+            };
         }
 
         throw createBlockEntityError("Operação de fornalha não permitida.");
@@ -2110,14 +2132,20 @@ io.on("connection", (socket) => {
 
                     const nextBlockId = packedValue & 255;
 
-                    if (
-                        blockEntityBlockIds.has(previousBlockId) ||
-                        blockEntityBlockIds.has(nextBlockId)
-                    ) {
+
+                    const changesBlockEntityType =
+                        previousBlockId !== nextBlockId &&
+                        (
+                            blockEntityBlockIds.has(previousBlockId) ||
+                            blockEntityBlockIds.has(nextBlockId)
+                        );
+
+                    if (changesBlockEntityType) {
                         throw createRequestError(
                             "Este bloco exige uma operação de Block Entity."
                         );
                     }
+
 
                     modifications.set(index, packedValue);
                 }
