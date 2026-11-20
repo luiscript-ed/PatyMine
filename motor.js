@@ -27841,6 +27841,7 @@ class zg {
         this.ticks = 1e3,
         this.day = 0,
         this.chests = new Map,
+        this.blockEntityRevisions = new Map,
         this.furnaces = new Map,
         this.saplings = new Map,
         this.elapsed = 0,
@@ -28203,6 +28204,27 @@ class zg {
         );
 
         
+        this.multiplayerSocket.on(
+            "world:block-entity:created",
+            (payload) => {
+                this.applyRemoteBlockEntity(payload);
+            }
+        );
+
+        this.multiplayerSocket.on(
+            "world:block-entity:updated",
+            (payload) => {
+                this.applyRemoteBlockEntity(payload);
+            }
+        );
+
+        this.multiplayerSocket.on(
+            "world:block-entity:removed",
+            (payload) => {
+                this.removeRemoteBlockEntity(payload);
+            }
+        );
+
     }
 async ensureMultiplayerConnected() {
     if (!this.multiplayerToken || !this.multiplayerUser) {
@@ -28472,6 +28494,79 @@ async loadSharedWorld(worldId) {
         mods[`${chunkX},${chunkZ}`] = chunk.chunk_data;
     }
 
+    if (!Array.isArray(response.blockEntities)) {
+        throw new Error("O servidor retornou Block Entities inválidas.");
+    }
+
+    const blockEntities = response.blockEntities.map((entity) => {
+
+        if (
+            !entity ||
+            typeof entity !== "object" ||
+            Array.isArray(entity)
+        ) {
+            throw new Error("Uma Block Entity retornada é inválida.");
+        }
+
+        const x = Number(entity.x);
+        const y = Number(entity.y);
+        const z = Number(entity.z);
+
+        const dataVersion = Number(entity.data_version);
+        const revision = Number(entity.revision);
+
+        if (
+            typeof entity.world_id !== "string" ||
+            entity.world_id.toLowerCase() !== meta.id.toLowerCase() ||
+
+            ![x, y, z].every(Number.isSafeInteger) ||
+
+            Math.abs(x) > 100000 ||
+            y < 0 ||
+            y >= Wt ||
+            Math.abs(z) > 100000 ||
+
+            typeof entity.entity_type !== "string" ||
+            !/^[a-z][a-z0-9:_-]{0,63}$/.test(entity.entity_type) ||
+
+            !Number.isSafeInteger(dataVersion) ||
+            dataVersion < 1 ||
+
+            !Number.isSafeInteger(revision) ||
+            revision < 1 ||
+
+            !entity.data ||
+            typeof entity.data !== "object" ||
+            Array.isArray(entity.data)
+        ) {
+            throw new Error("Uma Block Entity contém dados inválidos.");
+        }
+
+        // Validação específica dos baús.
+        if (
+            entity.entity_type === "chest" &&
+            (
+                dataVersion !== 1 ||
+                !Array.isArray(entity.data.inventory) ||
+                entity.data.inventory.length !== 27
+            )
+        ) {
+            throw new Error(
+                "O inventário de um baú retornado é inválido ou incompatível."
+            );
+        }
+
+        return {
+            ...entity,
+            x,
+            y,
+            z,
+            data_version: dataVersion,
+            revision
+        };
+    });
+
+
     let player = null;
 
     if (response.playerState) {
@@ -28543,7 +28638,7 @@ async loadSharedWorld(worldId) {
             : 0,
 
         mods,
-
+        blockEntities,
         chests: settings.chests ?? {},
         furnaces: settings.furnaces ?? {},
         animals: Array.isArray(settings.animals)
@@ -28928,6 +29023,7 @@ async loadSharedWorld(worldId) {
         this.entities.clear(),
         this.particles.clear(),
         this.chests.clear(),
+        this.blockEntityRevisions.clear(),
         this.furnaces.clear(),
         this.saplings.clear(),
         this.mining = null
@@ -29078,6 +29174,79 @@ async loadSharedWorld(worldId) {
                 Array.isArray(a) && this.chests.set(o, Array.from({
                     length: 27
                 }, (l, c) => br(a[c])));
+            
+            // Restaura as Block Entities persistidas no PostgreSQL.
+            // Os dados novos prevalecem sobre os dados legados
+            // quando representam a mesma coordenada.
+
+            for (const entity of e.blockEntities ?? []) {
+
+                const x = Number(entity.x);
+                const y = Number(entity.y);
+                const z = Number(entity.z);
+
+                const revision = Number(entity.revision);
+
+                if (
+                    ![x, y, z, revision].every(Number.isSafeInteger) ||
+
+                    Math.abs(x) > 100000 ||
+                    y < 0 ||
+                    y >= Wt ||
+                    Math.abs(z) > 100000 ||
+
+                    revision < 1
+                ) {
+                    continue;
+                }
+
+                const key = Cs(x, y, z);
+
+                // Registra a revisão da estrutura.
+                this.blockEntityRevisions.set(key, revision);
+
+                // Nesta etapa, integramos somente os baús.
+                if (entity.entity_type !== "chest") {
+                    this.chests.delete(key);
+                    continue;
+                }
+
+                if (
+                    Number(entity.data_version) !== 1 ||
+                    !entity.data ||
+                    !Array.isArray(entity.data.inventory) ||
+                    entity.data.inventory.length !== 27
+                ) {
+                    console.warn(
+                        "Dados de baú incompatíveis:",
+                        key
+                    );
+
+                    continue;
+                }
+
+                // Reconstrói os itens usando o normalizador original.
+                const inventory = entity.data.inventory.map(
+                    item => br(item)
+                );
+
+                const currentInventory = this.chests.get(key);
+
+                if (currentInventory) {
+
+                    currentInventory.splice(
+                        0,
+                        currentInventory.length,
+                        ...inventory
+                    );
+
+                } else {
+
+                    this.chests.set(key, inventory);
+
+                }
+            }
+
             for (const [o,a] of Object.entries(e.furnaces ?? {})) {
                 const l = a;
                 l && typeof l == "object" && this.furnaces.set(o, {
@@ -30456,6 +30625,212 @@ async loadSharedWorld(worldId) {
 
         }
 
+    }
+
+
+    applyRemoteBlockEntity(payload) {
+
+        if (
+            !payload ||
+            !payload.entity ||
+            !this.world ||
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            payload.worldId !== this.meta.id ||
+            this.multiplayerWorldId !== this.meta.id
+        ) {
+            return;
+        }
+
+        const entity = payload.entity;
+
+        const x = Number(entity.x);
+        const y = Number(entity.y);
+        const z = Number(entity.z);
+
+        const revision = Number(entity.revision);
+        const dataVersion = Number(entity.data_version);
+
+        if (
+            typeof entity.world_id === "string" &&
+            entity.world_id.toLowerCase() !== this.meta.id.toLowerCase()
+        ) {
+            return;
+        }
+
+        if (
+            ![x, y, z, revision, dataVersion].every(Number.isSafeInteger) ||
+
+            Math.abs(x) > 100000 ||
+            y < 0 ||
+            y >= Wt ||
+            Math.abs(z) > 100000 ||
+
+            revision < 1 ||
+            dataVersion < 1 ||
+
+            typeof entity.entity_type !== "string"
+        ) {
+            return;
+        }
+
+        const key = Cs(x, y, z);
+
+        const currentRevision =
+            this.blockEntityRevisions.get(key);
+
+        // Ignora eventos atrasados ou repetidos.
+        if (
+            currentRevision !== undefined &&
+            revision <= currentRevision
+        ) {
+            return;
+        }
+
+        // Integração dos baús.
+        if (entity.entity_type === "chest") {
+
+            if (
+                dataVersion !== 1 ||
+                !entity.data ||
+                !Array.isArray(entity.data.inventory) ||
+                entity.data.inventory.length !== 27
+            ) {
+                console.warn(
+                    "Atualização remota de baú inválida:",
+                    key
+                );
+
+                return;
+            }
+
+            const inventory = entity.data.inventory.map(
+                item => br(item)
+            );
+
+            let currentInventory = this.chests.get(key);
+
+            if (currentInventory) {
+
+                // Preserva a referência utilizada pela interface.
+                currentInventory.splice(
+                    0,
+                    currentInventory.length,
+                    ...inventory
+                );
+
+            } else {
+
+                currentInventory = inventory;
+
+                this.chests.set(
+                    key,
+                    currentInventory
+                );
+
+            }
+
+            // Atualiza a revisão somente após validar os dados.
+            this.blockEntityRevisions.set(key, revision);
+
+            // Atualiza a interface caso este baú esteja aberto.
+            if (
+                this.ui?.containers?.kind === "chest" &&
+                this.ui.containers.chest === currentInventory
+            ) {
+                this.ui.containers.refresh();
+            }
+
+            return;
+        }
+
+        // Guarda a revisão de tipos ainda não integrados ao motor.
+        this.blockEntityRevisions.set(key, revision);
+
+        const previousInventory = this.chests.get(key);
+
+        this.chests.delete(key);
+
+        if (
+            previousInventory &&
+            this.ui?.containers?.kind === "chest" &&
+            this.ui.containers.chest === previousInventory
+        ) {
+            this.ui.containers.close();
+
+            this.ui.toast(
+                "Esta estrutura foi substituída por outro jogador."
+            );
+        }
+    }
+
+
+    removeRemoteBlockEntity(payload) {
+
+        if (
+            !payload ||
+            !payload.position ||
+            !this.world ||
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            payload.worldId !== this.meta.id ||
+            this.multiplayerWorldId !== this.meta.id
+        ) {
+            return;
+        }
+
+        const x = Number(payload.position.x);
+        const y = Number(payload.position.y);
+        const z = Number(payload.position.z);
+
+        const revision = Number(payload.revision);
+
+        if (
+            ![x, y, z, revision].every(Number.isSafeInteger) ||
+
+            Math.abs(x) > 100000 ||
+            y < 0 ||
+            y >= Wt ||
+            Math.abs(z) > 100000 ||
+
+            revision < 1
+        ) {
+            return;
+        }
+
+        const key = Cs(x, y, z);
+
+        const currentRevision =
+            this.blockEntityRevisions.get(key);
+
+        // Uma remoção antiga não pode apagar uma atualização
+        // que já tenha sido recebida com revisão superior.
+        if (
+            currentRevision !== undefined &&
+            revision < currentRevision
+        ) {
+            return;
+        }
+
+        const previousInventory = this.chests.get(key);
+
+        this.chests.delete(key);
+
+        this.blockEntityRevisions.delete(key);
+
+        // Fecha a interface caso o jogador esteja utilizando
+        // exatamente o baú que acabou de ser removido.
+        if (
+            previousInventory &&
+            this.ui?.containers?.kind === "chest" &&
+            this.ui.containers.chest === previousInventory
+        ) {
+            this.ui.containers.close();
+
+            this.ui.toast(
+                "Este baú foi removido por outro jogador."
+            );
+        }
     }
 
 

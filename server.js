@@ -586,22 +586,61 @@ BlockEntityRegistry.register("chest", {
         };
     },
 
+
     applyOperation(currentData, operation) {
-        if (
-            !isPlainObject(operation) ||
-            operation.type !== "slot:update" ||
-            !Number.isSafeInteger(operation.slot) ||
-            operation.slot < 0 ||
-            operation.slot >= 27
-        ) {
-            throw createBlockEntityError("Operação de baú inválida.");
+
+        if (!isPlainObject(operation)) {
+            throw createBlockEntityError(
+                "Operação de baú inválida."
+            );
         }
 
-        const inventory = [...currentData.inventory];
-        inventory[operation.slot] = normalizeBlockEntityItem(operation.item);
+        // Atualização individual de um slot.
+        if (operation.type === "slot:update") {
 
-        return { inventory };
+            if (
+                !Number.isSafeInteger(operation.slot) ||
+                operation.slot < 0 ||
+                operation.slot >= 27
+            ) {
+                throw createBlockEntityError(
+                    "Slot do baú inválido."
+                );
+            }
+
+            const inventory = [...currentData.inventory];
+
+            inventory[operation.slot] =
+                normalizeBlockEntityItem(operation.item);
+
+            return { inventory };
+        }
+
+        // Substituição completa do inventário.
+        if (operation.type === "inventory:replace") {
+
+            if (
+                !Array.isArray(operation.inventory) ||
+                operation.inventory.length !== 27
+            ) {
+                throw createBlockEntityError(
+                    "O inventário do baú deve possuir exatamente 27 espaços."
+                );
+            }
+
+            return {
+                inventory: operation.inventory.map(
+                    normalizeBlockEntityItem
+                )
+            };
+        }
+
+        throw createBlockEntityError(
+            "Operação de baú não permitida."
+        );
     }
+
+
 });
 
 
