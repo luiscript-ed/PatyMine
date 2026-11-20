@@ -2141,6 +2141,34 @@ io.on("connection", (socket) => {
                         );
 
                     if (changesBlockEntityType) {
+
+                        const localX = index % CHUNK_SIZE;
+
+                        const localZ =
+                            Math.floor(index / CHUNK_SIZE) % CHUNK_SIZE;
+
+                        const blockY =
+                            Math.floor(index / (CHUNK_SIZE * CHUNK_SIZE));
+
+                        console.error(
+                            "Tentativa de alteração física genérica de Block Entity:",
+                            {
+                                worldId,
+
+                                position: {
+                                    x: chunkX * CHUNK_SIZE + localX,
+                                    y: blockY,
+                                    z: chunkZ * CHUNK_SIZE + localZ
+                                },
+
+                                previousBlockId,
+                                nextBlockId,
+
+                                previousPackedValue,
+                                packedValue
+                            }
+                        );
+
                         throw createRequestError(
                             "Este bloco exige uma operação de Block Entity."
                         );
@@ -3176,30 +3204,43 @@ io.on("connection", (socket) => {
                 [worldId, position.x, position.y, position.z]
             );
 
+
             const storedEntity = entityResult.rows[0];
 
+            if (!storedEntity) {
+                throw createBlockEntityError(
+                    "Não existe uma Block Entity nesta posição.",
+                    "NOT_FOUND"
+                );
+            }
+
+            // Recupera o estado antes de qualquer operação.
+            const currentEntity = publicBlockEntity(storedEntity);
 
             const definition = BlockEntityRegistry.get(
                 storedEntity.entity_type
             );
 
-            if (!definition) {
+            if (
+                !definition ||
+                storedEntity.data_version !== definition.dataVersion
+            ) {
                 throw createBlockEntityError(
-                    "O tipo desta Block Entity não está registrado.",
-                    "UNKNOWN_ENTITY_TYPE"
+                    "O tipo ou a versão desta estrutura não é compatível.",
+                    "UNSUPPORTED_ENTITY_VERSION"
                 );
             }
 
+            // Verifica a revisão enquanto a linha está bloqueada.
             if (storedEntity.revision !== expectedRevision) {
                 throw createBlockEntityError(
-                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
+                    "A estrutura foi modificada por outro jogador.",
                     "REVISION_CONFLICT",
                     currentEntity
                 );
             }
 
-            // Se a estrutura estiver vinculada a um bloco,
-            // remove também sua representação física.
+            // A remoção física e lógica continua na mesma transação.
             const blockChange = Number.isSafeInteger(definition.blockId)
                 ? await persistBlockEntityBlockChange(
                     client,
@@ -3210,16 +3251,6 @@ io.on("connection", (socket) => {
                 )
                 : null;
 
-
-            const currentEntity = publicBlockEntity(storedEntity);
-
-            if (storedEntity.revision !== expectedRevision) {
-                throw createBlockEntityError(
-                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
-                    "REVISION_CONFLICT",
-                    currentEntity
-                );
-            }
 
             const deleteResult = await client.query(
                 `

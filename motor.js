@@ -27906,6 +27906,7 @@ class zg {
         this.pendingBlockEntityOperations = new Set,
         this.furnaces = new Map,
         this.furnacePersistedSnapshots = new Map,
+        this.furnacePendingOperations = new Map,
         this.furnaceSaveTimer = 0,
         this.saplings = new Map,
         this.elapsed = 0,
@@ -29155,6 +29156,7 @@ async loadSharedWorld(worldId) {
 
         this.furnaces.clear(),
         this.furnacePersistedSnapshots.clear(),
+        this.furnacePendingOperations.clear(),
         this.furnaceSaveTimer = 0,
         this.saplings.clear(),
         this.mining = null
@@ -31139,6 +31141,7 @@ async loadSharedWorld(worldId) {
 
         this.blockEntityRevisions.delete(key);
         this.furnacePersistedSnapshots.delete(key);
+        this.furnacePendingOperations.delete(key);
 
         this.blockEntitySaveBlocked.delete(key);
 
@@ -32173,6 +32176,7 @@ async loadSharedWorld(worldId) {
     }
 
 
+
     queueFurnaceStateSave(key, furnace) {
 
         if (
@@ -32180,8 +32184,7 @@ async loadSharedWorld(worldId) {
             this.meta.storage !== "shared" ||
             !this.multiplayerWorldId ||
             !furnace ||
-            this.blockEntitySaveBlocked.has(key) ||
-            this.blockEntitySaveQueues.has(key)
+            this.blockEntitySaveBlocked.has(key)
         ) {
             return;
         }
@@ -32194,12 +32197,11 @@ async loadSharedWorld(worldId) {
             return;
         }
 
-        const expectedRevision =
-            this.blockEntityRevisions.get(key);
+        const revision = this.blockEntityRevisions.get(key);
 
         if (
-            !Number.isSafeInteger(expectedRevision) ||
-            expectedRevision < 1
+            !Number.isSafeInteger(revision) ||
+            revision < 1
         ) {
             return;
         }
@@ -32228,108 +32230,227 @@ async loadSharedWorld(worldId) {
             return;
         }
 
-        const signature = JSON.stringify(snapshot);
+        const persistedText =
+            this.furnacePersistedSnapshots.get(key);
 
-        if (
-            signature ===
-            this.furnacePersistedSnapshots.get(key)
-        ) {
+        if (!persistedText) {
             return;
         }
 
-        const task = (async () => {
+        let persisted;
+
+        try {
+            persisted = JSON.parse(persistedText);
+        } catch {
+            return;
+        }
+
+        // Operações específicas: não sobrescrevemos
+        // campos que outro jogador tenha atualizado.
+        const operations = [];
+
+        for (const slot of ["input", "fuel", "output"]) {
+
+            if (
+                JSON.stringify(snapshot[slot]) !==
+                JSON.stringify(persisted[slot])
+            ) {
+                operations.push({
+                    type: "slot:update",
+                    slot,
+                    item: snapshot[slot]
+                });
+            }
+        }
+
+        const progressChanged = [
+            "burn",
+            "burnMax",
+            "cook"
+        ].some(field =>
+            snapshot[field] !== persisted[field]
+        );
+
+        if (progressChanged) {
+            operations.push({
+                type: "progress:update",
+                burn: snapshot.burn,
+                burnMax: snapshot.burnMax,
+                cook: snapshot.cook
+            });
+        }
+
+        if (operations.length === 0) {
+            return;
+        }
+
+        // Mantém as operações que ainda não foram enviadas.
+        let pending = this.furnacePendingOperations.get(key);
+
+        if (!pending) {
+            pending = [];
+            this.furnacePendingOperations.set(key, pending);
+        }
+
+        // Atualizações mais recentes do mesmo slot substituem
+        // operações antigas que ainda aguardam envio.
+        for (const operation of operations) {
+
+            const existingIndex = pending.findIndex(item => {
+
+                if (operation.type === "slot:update") {
+                    return (
+                        item.type === "slot:update" &&
+                        item.slot === operation.slot
+                    );
+                }
+
+                return item.type === "progress:update";
+            });
+
+            if (existingIndex >= 0) {
+                pending[existingIndex] = operation;
+            } else {
+                pending.push(operation);
+            }
+        }
+
+        // Já existe um processador para esta fornalha.
+        // As novas operações permanecem na fila.
+        if (this.blockEntitySaveQueues.has(key)) {
+            return;
+        }
+
+        let task;
+
+        task = Promise.resolve().then(async () => {
 
             try {
 
-                const response = await this.requestWorldEvent(
-                    "world:block-entity:update",
-                    {
-                        worldId,
+                while (
+                    pending.length > 0 &&
+                    this.meta?.id === worldId
+                ) {
+                    if (!this.furnaces.has(key)) {
+                    pending.length = 0;
+                    break;
+                }
 
-                        position: { x, y, z },
+                    const operation = pending.shift();
 
-                        expectedRevision,
+                    let completed = false;
 
-                        operation: {
-                            type: "state:replace",
-                            state: snapshot
+                    // Tenta novamente em caso de conflito de revisão.
+                    for (let attempt = 0; attempt < 3; attempt++) {
+
+                        const expectedRevision =
+                            this.blockEntityRevisions.get(key);
+
+                        if (
+                            !Number.isSafeInteger(expectedRevision) ||
+                            expectedRevision < 1
+                        ) {
+                            throw new Error(
+                                "Revisão da fornalha inválida."
+                            );
+                        }
+
+                        try {
+
+                            const response = await this.requestWorldEvent(
+                                "world:block-entity:update",
+                                {
+                                    worldId,
+
+                                    position: { x, y, z },
+
+                                    expectedRevision,
+
+                                    operation
+                                }
+                            );
+
+                            if (this.meta?.id !== worldId) {
+                                return;
+                            }
+
+                            if (
+                                !response.entity ||
+                                !Number.isSafeInteger(
+                                    Number(response.entity.revision)
+                                )
+                            ) {
+                                throw new Error(
+                                    "Resposta de atualização da fornalha inválida."
+                                );
+                            }
+
+                            // Aplica também o ACK no cliente que enviou.
+                            // Isso atualiza a revisão e o snapshot confirmado.
+                            this.applyRemoteBlockEntity({
+                                worldId,
+                                entity: response.entity
+                            });
+
+                            completed = true;
+                            break;
+
+                        } catch (error) {
+
+                            if (
+                                error.code === "REVISION_CONFLICT" &&
+                                error.currentEntity
+                            ) {
+
+                                // Recupera a versão mais recente.
+                                this.applyRemoteBlockEntity({
+                                    worldId,
+                                    entity: error.currentEntity
+                                });
+
+                                if (attempt < 2) {
+                                    continue;
+                                }
+                            }
+
+                            throw error;
                         }
                     }
-                );
 
-                if (this.meta?.id !== worldId) {
-                    return;
-                }
-
-                const acknowledgedRevision =
-                    Number(response.entity?.revision);
-
-                if (
-                    !Number.isSafeInteger(acknowledgedRevision)
-                ) {
-                    throw new Error(
-                        "O servidor retornou uma revisão inválida."
-                    );
-                }
-
-                const knownRevision =
-                    this.blockEntityRevisions.get(key);
-
-                if (
-                    knownRevision === expectedRevision ||
-                    knownRevision === undefined ||
-                    acknowledgedRevision >= knownRevision
-                ) {
-
-                    this.blockEntityRevisions.set(
-                        key,
-                        acknowledgedRevision
-                    );
-
-                    this.furnacePersistedSnapshots.set(
-                        key,
-                        JSON.stringify(response.entity.data)
-                    );
+                    if (!completed) {
+                        throw new Error(
+                            "Não foi possível confirmar a atualização da fornalha."
+                        );
+                    }
                 }
 
             } catch (error) {
 
-                if (this.meta?.id !== worldId) {
-                    return;
-                }
+                if (this.meta?.id === worldId) {
 
-                if (
-                    error.code === "REVISION_CONFLICT" &&
-                    error.currentEntity
-                ) {
+                    pending.length = 0;
 
-                    this.applyRemoteBlockEntity({
-                        worldId,
-                        entity: error.currentEntity
-                    });
-
-                    if (
-                        this.openFurnaceKey === key
-                    ) {
-                        this.ui.toast(
-                            "Outro jogador modificou esta fornalha. O estado atual foi recuperado."
-                        );
+                    if (error.currentEntity) {
+                        this.applyRemoteBlockEntity({
+                            worldId,
+                            entity: error.currentEntity
+                        });
                     }
 
-                    return;
+                    if (error.code !== "REVISION_CONFLICT") {
+                        this.blockEntitySaveBlocked.add(key);
+                    }
+
+                    console.error(
+                        "Erro na fila de persistência da fornalha:",
+                        error
+                    );
+
+                    this.ui.toast(
+                        error.message ||
+                        "Não foi possível salvar a fornalha."
+                    );
                 }
-
-                this.blockEntitySaveBlocked.add(key);
-
-                console.error(
-                    "Erro ao salvar fornalha:",
-                    error
-                );
-
-                this.ui.toast(
-                    error.message ||
-                    "Não foi possível salvar a fornalha."
-                );
 
             } finally {
 
@@ -32339,12 +32460,16 @@ async loadSharedWorld(worldId) {
                     this.blockEntitySaveQueues.delete(key);
                 }
 
+                if (pending.length === 0) {
+                    this.furnacePendingOperations.delete(key);
+                }
             }
 
-        })();
+        });
 
         this.blockEntitySaveQueues.set(key, task);
     }
+
 
 
 async placeSharedFurnace(x, y, z, meta, sound) {
@@ -32532,7 +32657,7 @@ async breakSharedFurnace(
     canHarvest,
     instant,
     remesh
-) {
+ ) {
 
     const worldId = this.meta?.id;
     const key = Cs(x, y, z);
@@ -32608,6 +32733,7 @@ async breakSharedFurnace(
 
         this.blockEntityRevisions.delete(key);
         this.furnacePersistedSnapshots.delete(key);
+        this.furnacePendingOperations.delete(key);
         this.blockEntitySaveBlocked.delete(key);
 
         if (
@@ -32758,36 +32884,149 @@ async breakSharedFurnace(
         );
 
     }
-}
+ }
+
+
+
+    isFurnaceSimulationAuthority() {
+
+        const userId = this.multiplayerUser?.id;
+
+        if (
+            !userId ||
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== this.meta.id
+        ) {
+            return false;
+        }
+
+        const onlinePlayers = new Set([
+            userId,
+            ...this.remotePlayers.keys()
+        ]);
+
+        // O proprietário tem prioridade quando está conectado.
+        const ownerId = this.meta.ownerId;
+
+        if (ownerId && onlinePlayers.has(ownerId)) {
+            return ownerId === userId;
+        }
+
+        // Caso contrário, todos elegem o mesmo jogador.
+        const authorityId = Array.from(onlinePlayers).sort()[0];
+
+        return authorityId === userId;
+    }
 
 
     tickBlockEntities(t) {
+
         const e = this.world;
+
         this.furnaceFxT -= t;
+
         const n = this.furnaceFxT <= 0;
+
         n && (this.furnaceFxT = .15);
-        for (const [s,r] of this.furnaces) {
-            const [o,a,l] = s.split(",").map(Number)
-              , c = r.burn > 0
-              , h = Dg(r, t);
-            if (!e.isLoaded(o, l))
-                continue;
-            if (e.getBlock(o, a, l) !== M.FURNACE) {
-                this.furnaces.delete(s);
-                continue
+
+        const sharedWorld = this.meta?.storage === "shared";
+
+        const simulationAuthority =
+            !sharedWorld ||
+            this.isFurnaceSimulationAuthority();
+
+        for (const [key, r] of this.furnaces) {
+
+            const [o, a, l] = key.split(",").map(Number);
+
+            let h;
+
+            if (sharedWorld) {
+
+                // No multiplayer, primeiro verificamos o chunk
+                // e o bloco físico.
+                if (!e.isLoaded(o, l)) {
+                    continue;
+                }
+
+                // A estrutura pode ter acabado de chegar pela rede.
+                // Não descartamos seu estado durante a sincronização.
+                if (e.getBlock(o, a, l) !== M.FURNACE) {
+                    continue;
+                }
+
+                // Somente o jogador eleito executa Dg().
+                h = simulationAuthority
+                    ? Dg(r, t)
+                    : r.burn > 0;
+
+            } else {
+
+                // Preserva o funcionamento dos mundos locais.
+                h = Dg(r, t);
+
+                if (!e.isLoaded(o, l)) {
+                    continue;
+                }
+
+                if (e.getBlock(o, a, l) !== M.FURNACE) {
+                    this.furnaces.delete(key);
+                    continue;
+                }
             }
+
             const u = e.getMeta(o, a, l);
-            if ((h !== c || (u & 4) !== 0 !== h) && e.setBlock(o, a, l, M.FURNACE, h ? u | 4 : u & -5),
-            h && n && this.player.body.pos.distanceToSquared(new I(o,a,l)) < 400) {
-                const [f,p] = Po[u & 3]
-                  , g = o + .5 + f * .55
-                  , _ = l + .5 + p * .55;
-                this.particles.flame(g, a + .3, _),
-                Math.random() < .4 && this.particles.smoke(o + .5, a + 1.05, l + .5)
+
+            const nextMeta = h
+                ? u | 4
+                : u & -5;
+
+            // O estado visual da chama é derivado do progresso.
+            // Não precisa gerar uma gravação independente do chunk.
+            if (nextMeta !== u) {
+
+                e.setBlock(
+                    o,
+                    a,
+                    l,
+                    M.FURNACE,
+                    nextMeta,
+                    false,
+                    true
+                );
+            }
+
+            if (
+                h &&
+                n &&
+                this.player.body.pos.distanceToSquared(
+                    new I(o, a, l)
+                ) < 400
+            ) {
+
+                const [f, p] = Po[u & 3];
+
+                const g = o + .5 + f * .55;
+                const positionZ = l + .5 + p * .55;
+
+                this.particles.flame(
+                    g,
+                    a + .3,
+                    positionZ
+                );
+
+                Math.random() < .4 &&
+                    this.particles.smoke(
+                        o + .5,
+                        a + 1.05,
+                        l + .5
+                    );
             }
         }
 
-        // Persistência periódica do progresso das fornalhas.
+        // Persistência periódica do progresso.
+        // Apenas a autoridade do mundo envia essas atualizações.
         this.furnaceSaveTimer -= t;
 
         if (this.furnaceSaveTimer <= 0) {
@@ -32795,7 +33034,8 @@ async breakSharedFurnace(
             this.furnaceSaveTimer = 2;
 
             if (
-                this.meta?.storage === "shared" &&
+                sharedWorld &&
+                simulationAuthority &&
                 this.multiplayerWorldId === this.meta.id
             ) {
 
@@ -32803,9 +33043,14 @@ async breakSharedFurnace(
 
                     if (
                         !this.blockEntityRevisions.has(key) ||
-                        this.blockEntitySaveBlocked.has(key) ||
-                        this.blockEntitySaveQueues.has(key)
+                        this.blockEntitySaveBlocked.has(key)
                     ) {
+                        continue;
+                    }
+
+                    const [x, , z] = key.split(",").map(Number);
+
+                    if (!e.isLoaded(x, z)) {
                         continue;
                     }
 
@@ -32816,6 +33061,7 @@ async breakSharedFurnace(
                 }
             }
         }
+
 
         if (n) {
             const s = this.player.body.pos;
@@ -32852,6 +33098,7 @@ async breakSharedFurnace(
             h !== M.OAK_SAPLING && h !== M.BIRCH_SAPLING && h !== M.SPRUCE_SAPLING || this.growTree(o, a, l, h)
         }
     }
+
     growTree(t, e, n, s) {
         const r = this.world;
         for (let c = 1; c < 7; c++)
