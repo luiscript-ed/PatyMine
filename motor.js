@@ -27252,7 +27252,7 @@ class kg {
 
             j("div", {
                 class: "footer-left"
-            }, "PatyMine Versão 1.1.2"),
+            }, "PatyMine Versão 1.4.4"),
 
             j("div", {
                 class: "footer-right"

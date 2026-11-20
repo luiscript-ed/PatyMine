@@ -28,6 +28,9 @@ const MAX_WORLD_COORDINATE = 100000;
 const MAX_PLAYER_DATA_BYTES = 16 * 1024;
 const MAX_INVENTORY_SLOTS = 36;
 
+// Limite do JSONB de cada Block Entity.
+const MAX_BLOCK_ENTITY_DATA_BYTES = 32 * 1024;
+
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
@@ -411,6 +414,365 @@ function isPlainObject(value) {
         !Array.isArray(value)
     );
 }
+
+
+// Erros específicos da persistência de Block Entities.
+function createBlockEntityError(message, code = "INVALID_REQUEST", currentEntity = null) {
+    const error = createRequestError(message);
+
+    error.code = code;
+
+    if (currentEntity) {
+        error.currentEntity = currentEntity;
+    }
+
+    return error;
+}
+
+
+function sendBlockEntitySocketError(ack, error, fallbackMessage) {
+    console.error("Erro em Block Entity:", error);
+
+    if (typeof ack === "function") {
+        ack({
+            success: false,
+            code: error.code || (
+                error.publicMessage
+                    ? "INVALID_REQUEST"
+                    : "INTERNAL_ERROR"
+            ),
+            message: error.publicMessage || fallbackMessage,
+            ...(error.currentEntity
+                ? { currentEntity: error.currentEntity }
+                : {})
+        });
+    }
+}
+
+
+// Normaliza itens no mesmo contrato já utilizado pelo inventário do jogador.
+function normalizeBlockEntityItem(item) {
+    if (item === null) {
+        return null;
+    }
+
+    if (
+        !isPlainObject(item) ||
+        !Number.isSafeInteger(item.id) ||
+        item.id < 0 ||
+        item.id > 65535 ||
+        !Number.isSafeInteger(item.count) ||
+        item.count < 1 ||
+        item.count > 9999
+    ) {
+        throw createBlockEntityError("Item da estrutura inválido.");
+    }
+
+    if (
+        item.dmg !== undefined &&
+        (
+            !Number.isSafeInteger(item.dmg) ||
+            item.dmg < 0 ||
+            item.dmg > 1000000
+        )
+    ) {
+        throw createBlockEntityError("Durabilidade do item inválida.");
+    }
+
+    return {
+        id: item.id,
+        count: item.count,
+        ...(item.dmg !== undefined ? { dmg: item.dmg } : {})
+    };
+}
+
+
+function normalizeBlockEntityPosition(position) {
+    if (!isPlainObject(position)) {
+        throw createBlockEntityError("Posição da estrutura inválida.");
+    }
+
+    const { x, y, z } = position;
+
+    if (
+        ![x, y, z].every(Number.isSafeInteger) ||
+        Math.abs(x) > MAX_WORLD_COORDINATE ||
+        Math.abs(z) > MAX_WORLD_COORDINATE ||
+        y < 0 ||
+        y >= WORLD_HEIGHT
+    ) {
+        throw createBlockEntityError(
+            "Coordenadas da estrutura fora dos limites permitidos."
+        );
+    }
+
+    return { x, y, z };
+}
+
+
+function validateBlockEntityDataSize(data) {
+    if (!isPlainObject(data)) {
+        throw createBlockEntityError("Os dados da estrutura devem ser um objeto.");
+    }
+
+    const json = JSON.stringify(data);
+
+    if (
+        typeof json !== "string" ||
+        Buffer.byteLength(json, "utf8") > MAX_BLOCK_ENTITY_DATA_BYTES
+    ) {
+        throw createBlockEntityError(
+            "Os dados da estrutura excedem o tamanho permitido."
+        );
+    }
+
+    return json;
+}
+
+
+// Registry do servidor: cada tipo define seu estado inicial,
+// validação e operações permitidas. O cliente nunca envia código executável.
+const BlockEntityRegistry = {
+    definitions: new Map(),
+
+    register(type, definition) {
+        if (
+            typeof type !== "string" ||
+            !/^[a-z][a-z0-9:_-]{0,63}$/.test(type) ||
+            !definition ||
+            !Number.isSafeInteger(definition.dataVersion) ||
+            definition.dataVersion < 1 ||
+            typeof definition.createDefault !== "function" ||
+            typeof definition.validateData !== "function" ||
+            typeof definition.applyOperation !== "function"
+        ) {
+            throw new Error(`Definição inválida de Block Entity: ${type}`);
+        }
+
+        if (this.definitions.has(type)) {
+            throw new Error(`Block Entity já registrada: ${type}`);
+        }
+
+        this.definitions.set(type, Object.freeze(definition));
+    },
+
+    get(type) {
+        return this.definitions.get(type) || null;
+    }
+};
+
+
+// Baú: 27 espaços, mantendo o formato dos itens existente no motor.
+BlockEntityRegistry.register("chest", {
+    dataVersion: 1,
+
+    createDefault() {
+        return {
+            inventory: Array(27).fill(null)
+        };
+    },
+
+    validateData(data) {
+        if (
+            !isPlainObject(data) ||
+            !Array.isArray(data.inventory) ||
+            data.inventory.length !== 27
+        ) {
+            throw createBlockEntityError("Inventário do baú inválido.");
+        }
+
+        return {
+            inventory: data.inventory.map(normalizeBlockEntityItem)
+        };
+    },
+
+    applyOperation(currentData, operation) {
+        if (
+            !isPlainObject(operation) ||
+            operation.type !== "slot:update" ||
+            !Number.isSafeInteger(operation.slot) ||
+            operation.slot < 0 ||
+            operation.slot >= 27
+        ) {
+            throw createBlockEntityError("Operação de baú inválida.");
+        }
+
+        const inventory = [...currentData.inventory];
+        inventory[operation.slot] = normalizeBlockEntityItem(operation.item);
+
+        return { inventory };
+    }
+});
+
+
+// Fornalha: inventários e progresso seguem os campos já usados por Dg().
+BlockEntityRegistry.register("furnace", {
+    dataVersion: 1,
+
+    createDefault() {
+        return {
+            input: null,
+            fuel: null,
+            output: null,
+            burn: 0,
+            burnMax: 0,
+            cook: 0
+        };
+    },
+
+    validateData(data) {
+        if (!isPlainObject(data)) {
+            throw createBlockEntityError("Dados da fornalha inválidos.");
+        }
+
+        const progress = [data.burn, data.burnMax, data.cook];
+
+        if (
+            !progress.every(value =>
+                Number.isFinite(value) && value >= 0 && value <= 1000000
+            )
+        ) {
+            throw createBlockEntityError("Progresso da fornalha inválido.");
+        }
+
+        return {
+            input: normalizeBlockEntityItem(data.input),
+            fuel: normalizeBlockEntityItem(data.fuel),
+            output: normalizeBlockEntityItem(data.output),
+            burn: data.burn,
+            burnMax: data.burnMax,
+            cook: data.cook
+        };
+    },
+
+    applyOperation(currentData, operation) {
+        if (!isPlainObject(operation)) {
+            throw createBlockEntityError("Operação de fornalha inválida.");
+        }
+
+        if (operation.type === "slot:update") {
+            if (!["input", "fuel", "output"].includes(operation.slot)) {
+                throw createBlockEntityError("Slot da fornalha inválido.");
+            }
+
+            return {
+                ...currentData,
+                [operation.slot]: normalizeBlockEntityItem(operation.item)
+            };
+        }
+
+        if (operation.type === "progress:update") {
+            const next = { ...currentData };
+            let changed = false;
+
+            for (const field of ["burn", "burnMax", "cook"]) {
+                if (operation[field] === undefined) {
+                    continue;
+                }
+
+                const value = operation[field];
+
+                if (
+                    !Number.isFinite(value) ||
+                    value < 0 ||
+                    value > 1000000
+                ) {
+                    throw createBlockEntityError(
+                        `Valor inválido para ${field} da fornalha.`
+                    );
+                }
+
+                next[field] = value;
+                changed = true;
+            }
+
+            if (!changed) {
+                throw createBlockEntityError(
+                    "Nenhum valor de progresso foi informado."
+                );
+            }
+
+            return next;
+        }
+
+        throw createBlockEntityError("Operação de fornalha não permitida.");
+    }
+});
+
+
+function validateBlockEntitySession(socket, worldId) {
+    if (!isValidWorldId(worldId)) {
+        throw createBlockEntityError("Identificador do mundo inválido.");
+    }
+
+    const userId = getAuthenticatedUserId(socket);
+
+    if (socket.data.worldId !== worldId) {
+        throw createBlockEntityError(
+            "Você não está conectado a este mundo.",
+            "WORLD_SESSION_REQUIRED"
+        );
+    }
+
+    const activePlayer = worlds.get(worldId)?.get(userId);
+
+    if (!activePlayer || activePlayer.socketId !== socket.id) {
+        throw createBlockEntityError(
+            "Sessão de jogador inválida.",
+            "INVALID_SESSION"
+        );
+    }
+
+    return userId;
+}
+
+
+async function lockBlockEntityWorldAccess(client, worldId, userId) {
+    const accessResult = await client.query(
+        `
+        SELECT w.id
+        FROM worlds w
+        WHERE
+            w.id = $1
+            AND (
+                w.owner_id = $2
+                OR w.visibility = 'public'
+                OR EXISTS (
+                    SELECT 1
+                    FROM world_members wm
+                    WHERE
+                        wm.world_id = w.id
+                        AND wm.user_id = $2
+                )
+            )
+        FOR SHARE OF w
+        `,
+        [worldId, userId]
+    );
+
+    if (accessResult.rows.length === 0) {
+        throw createBlockEntityError(
+            "Você não possui autorização para modificar este mundo.",
+            "WORLD_ACCESS_DENIED"
+        );
+    }
+}
+
+
+function publicBlockEntity(entity) {
+    return {
+        world_id: entity.world_id,
+        x: entity.x,
+        y: entity.y,
+        z: entity.z,
+        entity_type: entity.entity_type,
+        data_version: entity.data_version,
+        data: entity.data,
+        revision: entity.revision,
+        updated_at: entity.updated_at
+    };
+}
+
 
 function publicPlayer(player) {
     const { socketId, ...publicData } = player;
@@ -1947,6 +2309,30 @@ io.on("connection", (socket) => {
                 [worldId]
             );
 
+            // Carrega as estruturas persistentes vinculadas a blocos.
+            // A consulta usa a mesma transação REPEATABLE READ do mundo.
+            const blockEntitiesResult = await client.query(
+                `
+                SELECT
+                    world_id,
+                    x,
+                    y,
+                    z,
+                    entity_type,
+                    data_version,
+                    data,
+                    revision,
+                    updated_at
+
+                FROM world_block_entities
+
+                WHERE world_id = $1
+
+                ORDER BY x, y, z
+                `,
+                [worldId]
+            );
+
             // Carrega somente o estado do jogador autenticado.
             const playerResult = await client.query(
                 `
@@ -1981,6 +2367,8 @@ io.on("connection", (socket) => {
 
                     chunks: chunksResult.rows,
 
+                    blockEntities: blockEntitiesResult.rows,
+
                     playerState:
                         playerResult.rows[0] ?? null
                 });
@@ -2009,6 +2397,469 @@ io.on("connection", (socket) => {
             client?.release();
         }
     });
+
+    // Criação de uma Block Entity.
+    // O estado inicial é produzido pelo Registry do servidor.
+    socket.on("world:block-entity:create", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            if (!isPlainObject(payload)) {
+                throw createBlockEntityError("Dados da estrutura inválidos.");
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateBlockEntitySession(socket, worldId);
+            const position = normalizeBlockEntityPosition(payload.position);
+            const entityType = payload.entityType;
+
+            if (typeof entityType !== "string") {
+                throw createBlockEntityError("Tipo de estrutura inválido.");
+            }
+
+            const definition = BlockEntityRegistry.get(entityType);
+
+            if (!definition) {
+                throw createBlockEntityError(
+                    "Este tipo de Block Entity não está registrado no servidor.",
+                    "UNKNOWN_ENTITY_TYPE"
+                );
+            }
+
+            const initialData = definition.validateData(
+                definition.createDefault(),
+                definition.dataVersion
+            );
+            const dataJson = validateBlockEntityDataSize(initialData);
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            await lockBlockEntityWorldAccess(client, worldId, userId);
+
+            const result = await client.query(
+                `
+                INSERT INTO world_block_entities (
+                    world_id,
+                    x,
+                    y,
+                    z,
+                    entity_type,
+                    data_version,
+                    data,
+                    revision,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 1, NOW())
+                ON CONFLICT (world_id, x, y, z) DO NOTHING
+                RETURNING
+                    world_id,
+                    x,
+                    y,
+                    z,
+                    entity_type,
+                    data_version,
+                    data,
+                    revision,
+                    updated_at
+                `,
+                [
+                    worldId,
+                    position.x,
+                    position.y,
+                    position.z,
+                    entityType,
+                    definition.dataVersion,
+                    dataJson
+                ]
+            );
+
+            if (result.rows.length === 0) {
+                throw createBlockEntityError(
+                    "Já existe uma Block Entity nesta posição.",
+                    "ALREADY_EXISTS"
+                );
+            }
+
+            const entity = publicBlockEntity(result.rows[0]);
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            // A transmissão ocorre somente depois do COMMIT.
+            socket.to(worldId).emit("world:block-entity:created", {
+                worldId,
+                entity
+            });
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entity
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback da Block Entity:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendBlockEntitySocketError(
+                ack,
+                error,
+                "Não foi possível criar a estrutura."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
+
+    // Atualização de uma Block Entity por operação validada no servidor.
+    socket.on("world:block-entity:update", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            if (!isPlainObject(payload)) {
+                throw createBlockEntityError("Dados da atualização inválidos.");
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateBlockEntitySession(socket, worldId);
+            const position = normalizeBlockEntityPosition(payload.position);
+            const expectedRevision = payload.expectedRevision;
+
+            if (
+                !Number.isSafeInteger(expectedRevision) ||
+                expectedRevision < 1
+            ) {
+                throw createBlockEntityError("Revisão esperada inválida.");
+            }
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            await lockBlockEntityWorldAccess(client, worldId, userId);
+
+            // O bloqueio serializa atualizações simultâneas na mesma posição.
+            const entityResult = await client.query(
+                `
+                SELECT
+                    world_id,
+                    x,
+                    y,
+                    z,
+                    entity_type,
+                    data_version,
+                    data,
+                    revision,
+                    updated_at
+
+                FROM world_block_entities
+
+                WHERE
+                    world_id = $1
+                    AND x = $2
+                    AND y = $3
+                    AND z = $4
+
+                FOR UPDATE
+                `,
+                [worldId, position.x, position.y, position.z]
+            );
+
+            const storedEntity = entityResult.rows[0];
+
+            if (!storedEntity) {
+                throw createBlockEntityError(
+                    "Não existe uma Block Entity nesta posição.",
+                    "NOT_FOUND"
+                );
+            }
+
+            const currentEntity = publicBlockEntity(storedEntity);
+
+            if (storedEntity.revision !== expectedRevision) {
+                throw createBlockEntityError(
+                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de tentar novamente.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            const definition = BlockEntityRegistry.get(storedEntity.entity_type);
+
+            if (
+                !definition ||
+                storedEntity.data_version !== definition.dataVersion
+            ) {
+                throw createBlockEntityError(
+                    "A versão desta estrutura não é compatível com o servidor.",
+                    "UNSUPPORTED_ENTITY_VERSION"
+                );
+            }
+
+            const currentData = definition.validateData(
+                storedEntity.data,
+                storedEntity.data_version
+            );
+
+            const operationResult = definition.applyOperation(
+                currentData,
+                payload.operation,
+                storedEntity.data_version
+            );
+
+            const updatedData = definition.validateData(
+                operationResult,
+                storedEntity.data_version
+            );
+            const dataJson = validateBlockEntityDataSize(updatedData);
+
+            const updateResult = await client.query(
+                `
+                UPDATE world_block_entities
+
+                SET
+                    data = $5::jsonb,
+                    revision = revision + 1,
+                    updated_at = NOW()
+
+                WHERE
+                    world_id = $1
+                    AND x = $2
+                    AND y = $3
+                    AND z = $4
+                    AND revision = $6
+
+                RETURNING
+                    world_id,
+                    x,
+                    y,
+                    z,
+                    entity_type,
+                    data_version,
+                    data,
+                    revision,
+                    updated_at
+                `,
+                [
+                    worldId,
+                    position.x,
+                    position.y,
+                    position.z,
+                    dataJson,
+                    expectedRevision
+                ]
+            );
+
+            if (updateResult.rows.length === 0) {
+                throw createBlockEntityError(
+                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de tentar novamente.",
+                    "REVISION_CONFLICT"
+                );
+            }
+
+            const entity = publicBlockEntity(updateResult.rows[0]);
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            // Os outros jogadores recebem somente dados já confirmados.
+            socket.to(worldId).emit("world:block-entity:updated", {
+                worldId,
+                entity
+            });
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entity
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback da atualização da Block Entity:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendBlockEntitySocketError(
+                ack,
+                error,
+                "Não foi possível atualizar a estrutura."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
+
+    // Remoção de uma Block Entity com controle de revisão.
+    socket.on("world:block-entity:remove", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            if (!isPlainObject(payload)) {
+                throw createBlockEntityError("Dados da remoção inválidos.");
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateBlockEntitySession(socket, worldId);
+            const position = normalizeBlockEntityPosition(payload.position);
+            const expectedRevision = payload.expectedRevision;
+
+            if (
+                !Number.isSafeInteger(expectedRevision) ||
+                expectedRevision < 1
+            ) {
+                throw createBlockEntityError("Revisão esperada inválida.");
+            }
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            await lockBlockEntityWorldAccess(client, worldId, userId);
+
+            const entityResult = await client.query(
+                `
+                SELECT
+                    world_id,
+                    x,
+                    y,
+                    z,
+                    entity_type,
+                    data_version,
+                    data,
+                    revision,
+                    updated_at
+
+                FROM world_block_entities
+
+                WHERE
+                    world_id = $1
+                    AND x = $2
+                    AND y = $3
+                    AND z = $4
+
+                FOR UPDATE
+                `,
+                [worldId, position.x, position.y, position.z]
+            );
+
+            const storedEntity = entityResult.rows[0];
+
+            if (!storedEntity) {
+                throw createBlockEntityError(
+                    "Não existe uma Block Entity nesta posição.",
+                    "NOT_FOUND"
+                );
+            }
+
+            const currentEntity = publicBlockEntity(storedEntity);
+
+            if (storedEntity.revision !== expectedRevision) {
+                throw createBlockEntityError(
+                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            const deleteResult = await client.query(
+                `
+                DELETE FROM world_block_entities
+
+                WHERE
+                    world_id = $1
+                    AND x = $2
+                    AND y = $3
+                    AND z = $4
+                    AND revision = $5
+
+                RETURNING revision
+                `,
+                [
+                    worldId,
+                    position.x,
+                    position.y,
+                    position.z,
+                    expectedRevision
+                ]
+            );
+
+            if (deleteResult.rows.length === 0) {
+                throw createBlockEntityError(
+                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
+                    "REVISION_CONFLICT"
+                );
+            }
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            const removed = {
+                worldId,
+                position,
+                revision: deleteResult.rows[0].revision
+            };
+
+            socket.to(worldId).emit(
+                "world:block-entity:removed",
+                removed
+            );
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    ...removed
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback da remoção da Block Entity:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendBlockEntitySocketError(
+                ack,
+                error,
+                "Não foi possível remover a estrutura."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
 
     // Desconexão
     socket.on("disconnect", () => {
