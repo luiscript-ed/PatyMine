@@ -31,6 +31,11 @@ const MAX_INVENTORY_SLOTS = 36;
 // Limite do JSONB de cada Block Entity.
 const MAX_BLOCK_ENTITY_DATA_BYTES = 32 * 1024;
 
+// Limites para entidades dinâmicas do mundo.
+const MAX_WORLD_ENTITY_DATA_BYTES = 32 * 1024;
+const DEFAULT_WORLD_ENTITY_PAGE_SIZE = 500;
+const MAX_WORLD_ENTITY_PAGE_SIZE = 2000;
+
 const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
@@ -527,6 +532,355 @@ function validateBlockEntityDataSize(data) {
     }
 
     return json;
+}
+
+
+// -----------------------------------------------------------------------------
+// World Entities: entidades dinâmicas independentes de blocos.
+// -----------------------------------------------------------------------------
+
+function createWorldEntityError(
+    message,
+    code = "INVALID_REQUEST",
+    currentEntity = null
+) {
+    const error = createRequestError(message);
+    error.code = code;
+
+    if (currentEntity) {
+        error.currentEntity = currentEntity;
+    }
+
+    return error;
+}
+
+
+function sendWorldEntitySocketError(ack, error, fallbackMessage) {
+    console.error("Erro em World Entity:", error);
+
+    if (typeof ack === "function") {
+        ack({
+            success: false,
+            code: error.code || (
+                error.publicMessage
+                    ? "INVALID_REQUEST"
+                    : "INTERNAL_ERROR"
+            ),
+            message: error.publicMessage || fallbackMessage,
+            ...(error.currentEntity
+                ? { currentEntity: error.currentEntity }
+                : {})
+        });
+    }
+}
+
+
+function validateWorldEntitySession(socket, worldId) {
+    if (!isValidWorldId(worldId)) {
+        throw createWorldEntityError(
+            "Identificador do mundo inválido."
+        );
+    }
+
+    const userId = getAuthenticatedUserId(socket);
+
+    if (socket.data.worldId !== worldId) {
+        throw createWorldEntityError(
+            "Você não está conectado a este mundo.",
+            "WORLD_SESSION_REQUIRED"
+        );
+    }
+
+    const activePlayer = worlds.get(worldId)?.get(userId);
+
+    if (!activePlayer || activePlayer.socketId !== socket.id) {
+        throw createWorldEntityError(
+            "Sessão de jogador inválida.",
+            "INVALID_SESSION"
+        );
+    }
+
+    return userId;
+}
+
+
+async function lockWorldEntityWorldAccess(client, worldId, userId) {
+    const accessResult = await client.query(
+        `
+        SELECT w.id
+        FROM worlds w
+        WHERE
+            w.id = $1
+            AND (
+                w.owner_id = $2
+                OR w.visibility = 'public'
+                OR EXISTS (
+                    SELECT 1
+                    FROM world_members wm
+                    WHERE
+                        wm.world_id = w.id
+                        AND wm.user_id = $2
+                )
+            )
+        FOR SHARE OF w
+        `,
+        [worldId, userId]
+    );
+
+    if (accessResult.rows.length === 0) {
+        throw createWorldEntityError(
+            "Você não possui autorização para modificar este mundo.",
+            "WORLD_ACCESS_DENIED"
+        );
+    }
+}
+
+
+function normalizeWorldEntityId(id) {
+    if (typeof id !== "string" || !UUID_REGEX.test(id)) {
+        throw createWorldEntityError(
+            "Identificador da entidade inválido."
+        );
+    }
+
+    return id;
+}
+
+
+function normalizeWorldEntityTransform(transform, current = null) {
+    if (!isPlainObject(transform)) {
+        throw createWorldEntityError(
+            "Transformação da entidade inválida."
+        );
+    }
+
+    const allowedFields = new Set(["position", "yaw", "velocity"]);
+
+    if (Object.keys(transform).some(field => !allowedFields.has(field))) {
+        throw createWorldEntityError(
+            "A transformação contém campos não permitidos."
+        );
+    }
+
+    if (!current && !isPlainObject(transform.position)) {
+        throw createWorldEntityError(
+            "A posição inicial da entidade é obrigatória."
+        );
+    }
+
+    if (
+        transform.position !== undefined &&
+        !isPlainObject(transform.position)
+    ) {
+        throw createWorldEntityError(
+            "A posição da entidade é inválida."
+        );
+    }
+
+    if (
+        transform.velocity !== undefined &&
+        !isPlainObject(transform.velocity)
+    ) {
+        throw createWorldEntityError(
+            "A velocidade da entidade é inválida."
+        );
+    }
+
+    if (Object.keys(transform).length === 0) {
+        throw createWorldEntityError(
+            "Informe pelo menos um campo da transformação."
+        );
+    }
+
+    const position = transform.position || {};
+    const velocity = transform.velocity || {};
+
+    if (
+        (transform.position !== undefined && Object.keys(position).length === 0) ||
+        (transform.velocity !== undefined && Object.keys(velocity).length === 0)
+    ) {
+        throw createWorldEntityError(
+            "A posição ou velocidade informada não contém coordenadas."
+        );
+    }
+
+    const allowedVectorFields = new Set(["x", "y", "z"]);
+
+    if (
+        Object.keys(position).some(field => !allowedVectorFields.has(field)) ||
+        Object.keys(velocity).some(field => !allowedVectorFields.has(field))
+    ) {
+        throw createWorldEntityError(
+            "A posição ou velocidade contém campos não permitidos."
+        );
+    }
+
+    const readField = (object, field, fallback) =>
+        Object.prototype.hasOwnProperty.call(object, field)
+            ? object[field]
+            : fallback;
+
+    const positionX = readField(position, "x", current?.position_x);
+    const positionY = readField(position, "y", current?.position_y);
+    const positionZ = readField(position, "z", current?.position_z);
+
+    const yaw = readField(transform, "yaw", current?.yaw ?? 0);
+
+    const velocityX = readField(velocity, "x", current?.velocity_x ?? 0);
+    const velocityY = readField(velocity, "y", current?.velocity_y ?? 0);
+    const velocityZ = readField(velocity, "z", current?.velocity_z ?? 0);
+
+    if (
+        ![positionX, positionY, positionZ, yaw,
+            velocityX, velocityY, velocityZ].every(Number.isFinite) ||
+        Math.abs(positionX) > MAX_WORLD_COORDINATE ||
+        Math.abs(positionZ) > MAX_WORLD_COORDINATE ||
+        positionY < 0 ||
+        positionY >= WORLD_HEIGHT ||
+        Math.abs(yaw) > 1000000 ||
+        Math.abs(velocityX) > 1000 ||
+        Math.abs(velocityY) > 1000 ||
+        Math.abs(velocityZ) > 1000
+    ) {
+        throw createWorldEntityError(
+            "A posição, rotação ou velocidade da entidade está fora dos limites permitidos."
+        );
+    }
+
+    return {
+        position_x: positionX,
+        position_y: positionY,
+        position_z: positionZ,
+        yaw,
+        velocity_x: velocityX,
+        velocity_y: velocityY,
+        velocity_z: velocityZ
+    };
+}
+
+
+function validateWorldEntityDataSize(data) {
+    if (!isPlainObject(data)) {
+        throw createWorldEntityError(
+            "Os dados da entidade devem ser um objeto."
+        );
+    }
+
+    let json;
+
+    try {
+        json = JSON.stringify(data);
+    } catch {
+        throw createWorldEntityError(
+            "Os dados da entidade não podem ser serializados."
+        );
+    }
+
+    if (
+        typeof json !== "string" ||
+        Buffer.byteLength(json, "utf8") > MAX_WORLD_ENTITY_DATA_BYTES
+    ) {
+        throw createWorldEntityError(
+            "Os dados da entidade excedem o tamanho permitido."
+        );
+    }
+
+    return json;
+}
+
+
+function normalizeWorldEntityRevision(value) {
+    const revision = Number(value);
+
+    if (!Number.isSafeInteger(revision) || revision < 1) {
+        throw createWorldEntityError(
+            "A revisão armazenada da entidade é inválida.",
+            "INVALID_ENTITY_REVISION"
+        );
+    }
+
+    return revision;
+}
+
+
+function publicWorldEntity(entity) {
+    return {
+        id: entity.id,
+        world_id: entity.world_id,
+        entity_type: entity.entity_type,
+        data_version: Number(entity.data_version),
+        position_x: Number(entity.position_x),
+        position_y: Number(entity.position_y),
+        position_z: Number(entity.position_z),
+        yaw: Number(entity.yaw),
+        velocity_x: Number(entity.velocity_x),
+        velocity_y: Number(entity.velocity_y),
+        velocity_z: Number(entity.velocity_z),
+        data: entity.data,
+        revision: normalizeWorldEntityRevision(entity.revision),
+        created_at: entity.created_at,
+        updated_at: entity.updated_at
+    };
+}
+
+
+// Cada tipo define seu estado inicial, validação e operações permitidas.
+// A definição é código confiável do servidor; o cliente só envia dados.
+// As definições concretas de animais e criaturas serão registradas na Fase 4.6.
+// Nesta fase, o Registry fornece o contrato e rejeita tipos ainda não registrados.
+const WorldEntityRegistry = {
+    definitions: new Map(),
+
+    register(type, definition) {
+        if (
+            typeof type !== "string" ||
+            !/^[a-z][a-z0-9:_-]{0,63}$/.test(type) ||
+            !definition ||
+            !Number.isSafeInteger(definition.dataVersion) ||
+            definition.dataVersion < 1 ||
+            typeof definition.createDefault !== "function" ||
+            typeof definition.validateData !== "function" ||
+            typeof definition.applyOperation !== "function"
+        ) {
+            throw new Error(`Definição inválida de World Entity: ${type}`);
+        }
+
+        if (this.definitions.has(type)) {
+            throw new Error(`World Entity já registrada: ${type}`);
+        }
+
+        this.definitions.set(type, Object.freeze(definition));
+    },
+
+    get(type) {
+        return this.definitions.get(type) || null;
+    }
+};
+
+
+function validateRegisteredWorldEntityData(definition, data, dataVersion) {
+    let validatedData;
+
+    try {
+        validatedData = definition.validateData(data, dataVersion);
+    } catch (error) {
+        if (error?.publicMessage) {
+            throw error;
+        }
+
+        throw createWorldEntityError(
+            "Os dados informados para esta entidade são inválidos."
+        );
+    }
+
+    if (!isPlainObject(validatedData)) {
+        throw createWorldEntityError(
+            "A validação do tipo não retornou um objeto de dados válido.",
+            "INVALID_ENTITY_DEFINITION"
+        );
+    }
+
+    return validatedData;
 }
 
 
@@ -2655,6 +3009,36 @@ io.on("connection", (socket) => {
                 [worldId]
             );
 
+            // Carrega as entidades dinâmicas persistentes do mundo.
+            // A consulta participa da mesma transação REPEATABLE READ.
+            const worldEntitiesResult = await client.query(
+                `
+                SELECT
+                    id,
+                    world_id,
+                    entity_type,
+                    data_version,
+                    position_x,
+                    position_y,
+                    position_z,
+                    yaw,
+                    velocity_x,
+                    velocity_y,
+                    velocity_z,
+                    data,
+                    revision,
+                    created_at,
+                    updated_at
+
+                FROM world_entities
+
+                WHERE world_id = $1
+
+                ORDER BY id ASC
+                `,
+                [worldId]
+            );
+
             // Carrega somente o estado do jogador autenticado.
             const playerResult = await client.query(
                 `
@@ -2690,6 +3074,10 @@ io.on("connection", (socket) => {
                     chunks: chunksResult.rows,
 
                     blockEntities: blockEntitiesResult.rows,
+
+                    worldEntities: worldEntitiesResult.rows.map(
+                        publicWorldEntity
+                    ),
 
                     playerState:
                         playerResult.rows[0] ?? null
@@ -3329,6 +3717,594 @@ io.on("connection", (socket) => {
                 ack,
                 error,
                 "Não foi possível remover a estrutura."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
+
+    // Criação de uma entidade dinâmica registrada no servidor.
+    socket.on("world:entity:create", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            if (!isPlainObject(payload)) {
+                throw createWorldEntityError(
+                    "Dados de criação da entidade inválidos."
+                );
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+            const entityType = payload.entityType;
+
+            if (
+                typeof entityType !== "string" ||
+                !/^[a-z][a-z0-9:_-]{0,63}$/.test(entityType)
+            ) {
+                throw createWorldEntityError(
+                    "Tipo de entidade inválido."
+                );
+            }
+
+            const definition = WorldEntityRegistry.get(entityType);
+
+            if (!definition) {
+                throw createWorldEntityError(
+                    "Este tipo de entidade não está registrado no servidor.",
+                    "UNKNOWN_ENTITY_TYPE"
+                );
+            }
+
+            const transform = normalizeWorldEntityTransform(
+                payload.transform
+            );
+
+            const requestedData = payload.initialData === undefined
+                ? definition.createDefault()
+                : payload.initialData;
+
+            const initialData = validateRegisteredWorldEntityData(
+                definition,
+                requestedData,
+                definition.dataVersion
+            );
+
+            const dataJson = validateWorldEntityDataSize(initialData);
+            const entityId = randomUUID();
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            await lockWorldEntityWorldAccess(client, worldId, userId);
+
+            const result = await client.query(
+                `
+                INSERT INTO world_entities (
+                    id,
+                    world_id,
+                    entity_type,
+                    data_version,
+                    position_x,
+                    position_y,
+                    position_z,
+                    yaw,
+                    velocity_x,
+                    velocity_y,
+                    velocity_z,
+                    data,
+                    revision,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11, $12::jsonb, 1, NOW(), NOW()
+                )
+                RETURNING *
+                `,
+                [
+                    entityId,
+                    worldId,
+                    entityType,
+                    definition.dataVersion,
+                    transform.position_x,
+                    transform.position_y,
+                    transform.position_z,
+                    transform.yaw,
+                    transform.velocity_x,
+                    transform.velocity_y,
+                    transform.velocity_z,
+                    dataJson
+                ]
+            );
+
+            const entity = publicWorldEntity(result.rows[0]);
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            socket.to(worldId).emit("world:entity:created", {
+                worldId,
+                entity
+            });
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entity
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback da criação de entidade:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendWorldEntitySocketError(
+                ack,
+                error,
+                "Não foi possível criar a entidade."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
+
+    // Consulta paginada das entidades dinâmicas de um mundo.
+    socket.on("world:entities:list", async (payload = {}, ack) => {
+        try {
+            if (!isPlainObject(payload)) {
+                throw createWorldEntityError(
+                    "Dados da consulta de entidades inválidos."
+                );
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+
+            await lockWorldEntityWorldAccess(pool, worldId, userId);
+
+            const afterId = payload.afterId === undefined || payload.afterId === null
+                ? null
+                : normalizeWorldEntityId(payload.afterId);
+
+            const entityType = payload.entityType ?? null;
+
+            if (
+                entityType !== null &&
+                (
+                    typeof entityType !== "string" ||
+                    !/^[a-z][a-z0-9:_-]{0,63}$/.test(entityType)
+                )
+            ) {
+                throw createWorldEntityError(
+                    "Filtro de tipo de entidade inválido."
+                );
+            }
+
+            const limit = payload.limit === undefined
+                ? DEFAULT_WORLD_ENTITY_PAGE_SIZE
+                : payload.limit;
+
+            if (
+                !Number.isSafeInteger(limit) ||
+                limit < 1 ||
+                limit > MAX_WORLD_ENTITY_PAGE_SIZE
+            ) {
+                throw createWorldEntityError(
+                    `O limite da consulta deve estar entre 1 e ${MAX_WORLD_ENTITY_PAGE_SIZE}.`
+                );
+            }
+
+            const result = await pool.query(
+                `
+                SELECT
+                    e.id,
+                    e.world_id,
+                    e.entity_type,
+                    e.data_version,
+                    e.position_x,
+                    e.position_y,
+                    e.position_z,
+                    e.yaw,
+                    e.velocity_x,
+                    e.velocity_y,
+                    e.velocity_z,
+                    e.data,
+                    e.revision,
+                    e.created_at,
+                    e.updated_at
+
+                FROM world_entities e
+
+                INNER JOIN worlds w
+                    ON w.id = e.world_id
+
+                WHERE
+                    e.world_id = $1
+                    AND (
+                        w.owner_id = $2
+                        OR w.visibility = 'public'
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+                    AND ($3::uuid IS NULL OR e.id > $3::uuid)
+                    AND ($4::varchar IS NULL OR e.entity_type = $4)
+
+                ORDER BY e.id ASC
+                LIMIT $5
+                `,
+                [worldId, userId, afterId, entityType, limit + 1]
+            );
+
+            const hasMore = result.rows.length > limit;
+            const page = hasMore
+                ? result.rows.slice(0, limit)
+                : result.rows;
+            const entities = page.map(publicWorldEntity);
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entities,
+                    hasMore,
+                    nextCursor: hasMore
+                        ? entities[entities.length - 1].id
+                        : null
+                });
+            }
+
+        } catch (error) {
+            sendWorldEntitySocketError(
+                ack,
+                error,
+                "Não foi possível consultar as entidades do mundo."
+            );
+        }
+    });
+
+
+    // Atualiza os dados e/ou a transformação de uma entidade com controle de revisão.
+    socket.on("world:entity:update", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            if (!isPlainObject(payload)) {
+                throw createWorldEntityError(
+                    "Dados da atualização da entidade inválidos."
+                );
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+            const entityId = normalizeWorldEntityId(payload.entityId);
+            const expectedRevision = payload.expectedRevision;
+            const hasOperation = payload.operation !== undefined;
+            const hasTransform = payload.transform !== undefined;
+
+            if (
+                !Number.isSafeInteger(expectedRevision) ||
+                expectedRevision < 1
+            ) {
+                throw createWorldEntityError(
+                    "Revisão esperada inválida."
+                );
+            }
+
+            if (!hasOperation && !hasTransform) {
+                throw createWorldEntityError(
+                    "Informe uma operação ou uma transformação para atualizar a entidade."
+                );
+            }
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            await lockWorldEntityWorldAccess(client, worldId, userId);
+
+            const entityResult = await client.query(
+                `
+                SELECT *
+                FROM world_entities
+                WHERE world_id = $1 AND id = $2
+                FOR UPDATE
+                `,
+                [worldId, entityId]
+            );
+
+            const storedEntity = entityResult.rows[0];
+
+            if (!storedEntity) {
+                throw createWorldEntityError(
+                    "A entidade não existe neste mundo.",
+                    "NOT_FOUND"
+                );
+            }
+
+            const currentEntity = publicWorldEntity(storedEntity);
+            const currentRevision = currentEntity.revision;
+
+            if (currentRevision !== expectedRevision) {
+                throw createWorldEntityError(
+                    "A entidade foi modificada por outro jogador. Recarregue os dados antes de tentar novamente.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            const definition = WorldEntityRegistry.get(
+                storedEntity.entity_type
+            );
+
+            if (
+                !definition ||
+                Number(storedEntity.data_version) !== definition.dataVersion
+            ) {
+                throw createWorldEntityError(
+                    "O tipo ou a versão desta entidade não é compatível com o servidor.",
+                    "UNSUPPORTED_ENTITY_VERSION"
+                );
+            }
+
+            const currentData = validateRegisteredWorldEntityData(
+                definition,
+                storedEntity.data,
+                Number(storedEntity.data_version)
+            );
+
+            const updatedData = hasOperation
+                ? validateRegisteredWorldEntityData(
+                    definition,
+                    definition.applyOperation(
+                        currentData,
+                        payload.operation,
+                        Number(storedEntity.data_version)
+                    ),
+                    Number(storedEntity.data_version)
+                )
+                : currentData;
+
+            const dataJson = validateWorldEntityDataSize(updatedData);
+
+            const transform = hasTransform
+                ? normalizeWorldEntityTransform(
+                    payload.transform,
+                    storedEntity
+                )
+                : {
+                    position_x: Number(storedEntity.position_x),
+                    position_y: Number(storedEntity.position_y),
+                    position_z: Number(storedEntity.position_z),
+                    yaw: Number(storedEntity.yaw),
+                    velocity_x: Number(storedEntity.velocity_x),
+                    velocity_y: Number(storedEntity.velocity_y),
+                    velocity_z: Number(storedEntity.velocity_z)
+                };
+
+            const updateResult = await client.query(
+                `
+                UPDATE world_entities
+
+                SET
+                    position_x = $3,
+                    position_y = $4,
+                    position_z = $5,
+                    yaw = $6,
+                    velocity_x = $7,
+                    velocity_y = $8,
+                    velocity_z = $9,
+                    data = $10::jsonb,
+                    revision = revision + 1,
+                    updated_at = NOW()
+
+                WHERE
+                    world_id = $1
+                    AND id = $2
+                    AND revision = $11
+
+                RETURNING *
+                `,
+                [
+                    worldId,
+                    entityId,
+                    transform.position_x,
+                    transform.position_y,
+                    transform.position_z,
+                    transform.yaw,
+                    transform.velocity_x,
+                    transform.velocity_y,
+                    transform.velocity_z,
+                    dataJson,
+                    expectedRevision
+                ]
+            );
+
+            if (updateResult.rows.length === 0) {
+                throw createWorldEntityError(
+                    "A entidade foi modificada por outro jogador. Recarregue os dados antes de tentar novamente.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            const entity = publicWorldEntity(updateResult.rows[0]);
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            socket.to(worldId).emit("world:entity:updated", {
+                worldId,
+                entity
+            });
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entity
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback da atualização de entidade:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendWorldEntitySocketError(
+                ack,
+                error,
+                "Não foi possível atualizar a entidade."
+            );
+
+        } finally {
+            client?.release();
+        }
+    });
+
+
+    // Remove uma entidade com controle de revisão e transmite a remoção confirmada.
+    socket.on("world:entity:remove", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+
+        try {
+            if (!isPlainObject(payload)) {
+                throw createWorldEntityError(
+                    "Dados da remoção da entidade inválidos."
+                );
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+            const entityId = normalizeWorldEntityId(payload.entityId);
+            const expectedRevision = payload.expectedRevision;
+
+            if (
+                !Number.isSafeInteger(expectedRevision) ||
+                expectedRevision < 1
+            ) {
+                throw createWorldEntityError(
+                    "Revisão esperada inválida."
+                );
+            }
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            await lockWorldEntityWorldAccess(client, worldId, userId);
+
+            const entityResult = await client.query(
+                `
+                SELECT *
+                FROM world_entities
+                WHERE world_id = $1 AND id = $2
+                FOR UPDATE
+                `,
+                [worldId, entityId]
+            );
+
+            const storedEntity = entityResult.rows[0];
+
+            if (!storedEntity) {
+                throw createWorldEntityError(
+                    "A entidade não existe neste mundo.",
+                    "NOT_FOUND"
+                );
+            }
+
+            const currentEntity = publicWorldEntity(storedEntity);
+
+            if (currentEntity.revision !== expectedRevision) {
+                throw createWorldEntityError(
+                    "A entidade foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            const deleteResult = await client.query(
+                `
+                DELETE FROM world_entities
+                WHERE
+                    world_id = $1
+                    AND id = $2
+                    AND revision = $3
+                RETURNING id
+                `,
+                [worldId, entityId, expectedRevision]
+            );
+
+            if (deleteResult.rows.length === 0) {
+                throw createWorldEntityError(
+                    "A entidade foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            const removed = {
+                worldId,
+                entityId,
+                revision: currentEntity.revision + 1
+            };
+
+            socket.to(worldId).emit("world:entity:removed", removed);
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    ...removed,
+                    entity: currentEntity
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro no rollback da remoção de entidade:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendWorldEntitySocketError(
+                ack,
+                error,
+                "Não foi possível remover a entidade."
             );
 
         } finally {
