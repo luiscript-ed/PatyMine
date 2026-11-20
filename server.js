@@ -565,6 +565,7 @@ const BlockEntityRegistry = {
 // Baú: 27 espaços, mantendo o formato dos itens existente no motor.
 BlockEntityRegistry.register("chest", {
     dataVersion: 1,
+    blockId: 34,
 
     createDefault() {
         return {
@@ -809,6 +810,210 @@ function publicBlockEntity(entity) {
         data: entity.data,
         revision: entity.revision,
         updated_at: entity.updated_at
+    };
+}
+
+
+async function persistBlockEntityBlockChange(
+    client,
+    worldId,
+    position,
+    blockId,
+    meta = 0
+) {
+    if (
+        !Number.isSafeInteger(blockId) ||
+        blockId < 0 ||
+        blockId > 255 ||
+        !Number.isSafeInteger(meta) ||
+        meta < 0 ||
+        meta > 255
+    ) {
+        throw createBlockEntityError(
+            "Dados do bloco inválidos."
+        );
+    }
+
+    const chunkX = Math.floor(position.x / CHUNK_SIZE);
+    const chunkZ = Math.floor(position.z / CHUNK_SIZE);
+
+    const localX = position.x - chunkX * CHUNK_SIZE;
+    const localZ = position.z - chunkZ * CHUNK_SIZE;
+
+    const index =
+        localX +
+        localZ * CHUNK_SIZE +
+        position.y * CHUNK_SIZE * CHUNK_SIZE;
+
+    const packedValue = blockId | (meta << 8);
+
+    await client.query(
+        `
+        INSERT INTO world_chunks (
+            world_id,
+            chunk_x,
+            chunk_y,
+            chunk_z,
+            chunk_data
+        )
+        VALUES ($1, $2, 0, $3, '[]'::jsonb)
+
+        ON CONFLICT (
+            world_id,
+            chunk_x,
+            chunk_y,
+            chunk_z
+        )
+        DO NOTHING
+        `,
+        [worldId, chunkX, chunkZ]
+    );
+
+    const chunkResult = await client.query(
+        `
+        SELECT chunk_data
+        FROM world_chunks
+        WHERE
+            world_id = $1
+            AND chunk_x = $2
+            AND chunk_y = 0
+            AND chunk_z = $3
+        FOR UPDATE
+        `,
+        [worldId, chunkX, chunkZ]
+    );
+
+    const storedData = chunkResult.rows[0]?.chunk_data;
+
+    if (!Array.isArray(storedData)) {
+        throw new Error(
+            "Formato de chunk inválido no PostgreSQL."
+        );
+    }
+
+    const modifications = new Map();
+
+    for (const entry of storedData) {
+        if (
+            !Array.isArray(entry) ||
+            entry.length !== 2 ||
+            !Number.isSafeInteger(entry[0]) ||
+            !Number.isSafeInteger(entry[1]) ||
+            entry[0] < 0 ||
+            entry[0] >= CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT ||
+            entry[1] < 0 ||
+            entry[1] > 65535
+        ) {
+            throw new Error(
+                "Dados de chunk corrompidos no PostgreSQL."
+            );
+        }
+
+        modifications.set(entry[0], entry[1]);
+    }
+
+    modifications.set(index, packedValue);
+
+    const chunkData = Array.from(modifications.entries())
+        .sort((a, b) => a[0] - b[0]);
+
+    await client.query(
+        `
+        UPDATE world_chunks
+        SET
+            chunk_data = $4::jsonb,
+            updated_at = NOW()
+        WHERE
+            world_id = $1
+            AND chunk_x = $2
+            AND chunk_y = 0
+            AND chunk_z = $3
+        `,
+        [
+            worldId,
+            chunkX,
+            chunkZ,
+            JSON.stringify(chunkData)
+        ]
+    );
+
+    return {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+        blockId,
+        meta
+    };
+}
+
+
+// Consulta uma alteração física sem modificar o chunk.
+// Utilizada para verificar a existência de baús legados.
+async function getStoredWorldBlock(
+    client,
+    worldId,
+    position
+) {
+    const chunkX = Math.floor(position.x / CHUNK_SIZE);
+    const chunkZ = Math.floor(position.z / CHUNK_SIZE);
+
+    const localX = position.x - chunkX * CHUNK_SIZE;
+    const localZ = position.z - chunkZ * CHUNK_SIZE;
+
+    const index =
+        localX +
+        localZ * CHUNK_SIZE +
+        position.y * CHUNK_SIZE * CHUNK_SIZE;
+
+    const result = await client.query(
+        `
+        SELECT chunk_data
+        FROM world_chunks
+        WHERE
+            world_id = $1
+            AND chunk_x = $2
+            AND chunk_y = 0
+            AND chunk_z = $3
+        FOR SHARE
+        `,
+        [worldId, chunkX, chunkZ]
+    );
+
+    if (result.rows.length === 0) {
+        return null;
+    }
+
+    const storedData = result.rows[0].chunk_data;
+
+    if (!Array.isArray(storedData)) {
+        throw new Error(
+            "Formato de chunk inválido no PostgreSQL."
+        );
+    }
+
+    const entry = storedData.find(item =>
+        Array.isArray(item) &&
+        item.length === 2 &&
+        item[0] === index
+    );
+
+    if (!entry) {
+        return null;
+    }
+
+    if (
+        !Number.isSafeInteger(entry[1]) ||
+        entry[1] < 0 ||
+        entry[1] > 65535
+    ) {
+        throw new Error(
+            "Valor de bloco inválido no PostgreSQL."
+        );
+    }
+
+    return {
+        blockId: entry[1] & 255,
+        meta: entry[1] >>> 8
     };
 }
 
@@ -1887,14 +2092,36 @@ io.on("connection", (socket) => {
                 // Aplica somente as alterações recebidas.
                 // Não sobrescreve as demais construções.
 
+
+                const blockEntityBlockIds = new Set(
+                    Array.from(BlockEntityRegistry.definitions.values())
+                        .map(definition => definition.blockId)
+                        .filter(Number.isSafeInteger)
+                );
+
                 for (const [index, packedValue] of group.values) {
 
-                    modifications.set(
-                        index,
-                        packedValue
-                    );
+                    const previousPackedValue = modifications.get(index);
 
+                    const previousBlockId =
+                        previousPackedValue === undefined
+                            ? null
+                            : previousPackedValue & 255;
+
+                    const nextBlockId = packedValue & 255;
+
+                    if (
+                        blockEntityBlockIds.has(previousBlockId) ||
+                        blockEntityBlockIds.has(nextBlockId)
+                    ) {
+                        throw createRequestError(
+                            "Este bloco exige uma operação de Block Entity."
+                        );
+                    }
+
+                    modifications.set(index, packedValue);
                 }
+
 
 
                 // Serializa novamente no formato original:
@@ -2466,11 +2693,44 @@ io.on("connection", (socket) => {
                 );
             }
 
+
+            if (
+                payload.initialData !== undefined &&
+                payload.migration !== true
+            ) {
+                throw createBlockEntityError(
+                    "Dados iniciais só são permitidos durante uma migração.",
+                    "INVALID_MIGRATION"
+                );
+            }
+
+            const requestedInitialData =
+                payload.migration === true
+                    ? payload.initialData ?? definition.createDefault()
+                    : definition.createDefault();
+
             const initialData = definition.validateData(
-                definition.createDefault(),
+                requestedInitialData,
                 definition.dataVersion
             );
+
             const dataJson = validateBlockEntityDataSize(initialData);
+
+            const blockMeta = payload.meta ?? 0;
+
+            if (
+                definition.blockId !== undefined &&
+                (
+                    !Number.isSafeInteger(blockMeta) ||
+                    blockMeta < 0 ||
+                    blockMeta > 255
+                )
+            ) {
+                throw createBlockEntityError(
+                    "Metadados do bloco inválidos."
+                );
+            }
+
 
             client = await pool.connect();
             await client.query("BEGIN");
@@ -2515,14 +2775,84 @@ io.on("connection", (socket) => {
                 ]
             );
 
+
             if (result.rows.length === 0) {
+
+                const existingResult = await client.query(
+                    `
+                    SELECT
+                        world_id,
+                        x,
+                        y,
+                        z,
+                        entity_type,
+                        data_version,
+                        data,
+                        revision,
+                        updated_at
+                    FROM world_block_entities
+                    WHERE
+                        world_id = $1
+                        AND x = $2
+                        AND y = $3
+                        AND z = $4
+                    FOR UPDATE
+                    `,
+                    [
+                        worldId,
+                        position.x,
+                        position.y,
+                        position.z
+                    ]
+                );
+
                 throw createBlockEntityError(
                     "Já existe uma Block Entity nesta posição.",
-                    "ALREADY_EXISTS"
+                    "ALREADY_EXISTS",
+                    existingResult.rows[0]
+                        ? publicBlockEntity(existingResult.rows[0])
+                        : null
                 );
             }
 
             const entity = publicBlockEntity(result.rows[0]);
+
+            let blockChange = null;
+
+            if (Number.isSafeInteger(definition.blockId)) {
+
+                if (payload.migration === true) {
+
+                    // Não cria uma estrutura se o bloco físico não existir.
+                    const storedBlock = await getStoredWorldBlock(
+                        client,
+                        worldId,
+                        position
+                    );
+
+                    if (
+                        storedBlock?.blockId !== definition.blockId ||
+                        storedBlock?.meta !== blockMeta
+                    ) {
+                        throw createBlockEntityError(
+                            "O bloco físico não corresponde à estrutura que está sendo migrada.",
+                            "PHYSICAL_BLOCK_MISMATCH"
+                        );
+                    }
+
+                } else {
+
+                    // Criação física e lógica na mesma transação.
+                    blockChange = await persistBlockEntityBlockChange(
+                        client,
+                        worldId,
+                        position,
+                        definition.blockId,
+                        blockMeta
+                    );
+
+                }
+            }
 
             await client.query("COMMIT");
             transactionStarted = false;
@@ -2533,11 +2863,22 @@ io.on("connection", (socket) => {
                 entity
             });
 
+            if (blockChange) {
+                socket.to(worldId).emit(
+                    "world:blocks:changed",
+                    {
+                        worldId,
+                        changes: [blockChange]
+                    }
+                );
+            }
+
             if (typeof ack === "function") {
-                ack({
-                    success: true,
-                    entity
-                });
+             ack({
+                success: true,
+                entity,
+                ...(blockChange ? { blockChange } : {})
+            });
             }
 
         } catch (error) {
@@ -2809,12 +3150,38 @@ io.on("connection", (socket) => {
 
             const storedEntity = entityResult.rows[0];
 
-            if (!storedEntity) {
+
+            const definition = BlockEntityRegistry.get(
+                storedEntity.entity_type
+            );
+
+            if (!definition) {
                 throw createBlockEntityError(
-                    "Não existe uma Block Entity nesta posição.",
-                    "NOT_FOUND"
+                    "O tipo desta Block Entity não está registrado.",
+                    "UNKNOWN_ENTITY_TYPE"
                 );
             }
+
+            if (storedEntity.revision !== expectedRevision) {
+                throw createBlockEntityError(
+                    "A estrutura foi modificada por outro jogador. Recarregue os dados antes de removê-la.",
+                    "REVISION_CONFLICT",
+                    currentEntity
+                );
+            }
+
+            // Se a estrutura estiver vinculada a um bloco,
+            // remove também sua representação física.
+            const blockChange = Number.isSafeInteger(definition.blockId)
+                ? await persistBlockEntityBlockChange(
+                    client,
+                    worldId,
+                    position,
+                    0,
+                    0
+                )
+                : null;
+
 
             const currentEntity = publicBlockEntity(storedEntity);
 
@@ -2869,10 +3236,21 @@ io.on("connection", (socket) => {
                 removed
             );
 
+            if (blockChange) {
+                socket.to(worldId).emit(
+                    "world:blocks:changed",
+                    {
+                        worldId,
+                        changes: [blockChange]
+                    }
+                );
+            }
+
             if (typeof ack === "function") {
                 ack({
                     success: true,
-                    ...removed
+                    ...removed,
+                    entity: currentEntity
                 });
             }
 

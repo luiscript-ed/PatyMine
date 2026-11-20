@@ -26292,6 +26292,7 @@ class Ig {
         this.gridSize = 2,
         this.furnace = null,
         this.chest = null,
+        this.chestKey = null,
         this.player = null,
         this.creativeTab = "building",
         this.search = "",
@@ -26341,6 +26342,8 @@ class Ig {
         this.player = e,
         this.furnace = (n == null ? void 0 : n.furnace) ?? null,
         this.chest = (n == null ? void 0 : n.chest) ?? null,
+        this.chestKey =
+            (n == null ? void 0 : n.chestKey) ?? null,
         this.gridSize = t === "crafting" ? 3 : 2,
         this.grid = new Array(this.gridSize * this.gridSize).fill(null),
         this.build(),
@@ -26366,6 +26369,8 @@ class Ig {
         t(this.cursor),
         this.cursor = null,
         this.kind = null,
+        this.chestKey = null,
+        this.chest = null,
         this.el.classList.add("hidden"),
         this.el.innerHTML = "",
         this.cursorEl.classList.add("hidden"),
@@ -26687,9 +26692,31 @@ class Ig {
         this.furnace && this.progressEls.arrow && (this.progressEls.arrow.style.width = `${this.furnace.cook / yh * 100}%`,
         this.progressEls.flame.style.height = `${this.furnace.burnMax > 0 ? this.furnace.burn / this.furnace.burnMax * 100 : 0}%`))
     }
+
+    notifyChestChanged(previousSnapshot) {
+
+        if (
+            this.kind !== "chest" ||
+            !this.chestKey ||
+            !this.chest ||
+            JSON.stringify(this.chest) === previousSnapshot
+        ) {
+            return;
+        }
+
+        this.host.onChestInventoryChanged?.(
+            this.chestKey,
+            this.chest
+        );
+    }
+
     click(t, e, n) {
         const s = this.refs[t]
           , r = s.get();
+          const chestSnapshot =
+            this.kind === "chest" && this.chest
+                ? JSON.stringify(this.chest)
+                : null;
         if (s.section === "palette") {
             this.cursor ? this.cursor = null : r && (n ? this.player.inv.add({
                 id: r.id,
@@ -26739,7 +26766,8 @@ class Ig {
         }
         if (n && r) {
             this.quickMove(s, r),
-            this.refresh();
+            this.refresh(),
+            this.notifyChestChanged(chestSnapshot);
             return
         }
         const o = this.cursor;
@@ -26776,6 +26804,7 @@ class Ig {
                 o.count--),
                 o.count <= 0 && (this.cursor = null));
         this.refresh()
+        this.notifyChestChanged(chestSnapshot);
     }
     quickMove(t, e) {
         this.player.inv;
@@ -27842,6 +27871,9 @@ class zg {
         this.day = 0,
         this.chests = new Map,
         this.blockEntityRevisions = new Map,
+        this.blockEntitySaveQueues = new Map,
+        this.blockEntitySaveBlocked = new Set,
+        this.pendingBlockEntityOperations = new Set,
         this.furnaces = new Map,
         this.saplings = new Map,
         this.elapsed = 0,
@@ -27953,7 +27985,9 @@ class zg {
         this.ui = new kg(r,this.icons,{
             icons: this.icons,
             dropStack: o => this.dropStack(o),
-            onCraft: () => Zt.play("craft")
+            onCraft: () => Zt.play("craft"),
+            onChestInventoryChanged: (key, inventory) =>
+                this.queueChestInventorySave(key, inventory),
         }),
         this.ui.containers.onClose = () => {
             this.openFurnaceKey = null,
@@ -28316,13 +28350,17 @@ async requestWorldEvent(eventName, payload = {}) {
             clearTimeout(timeout);
 
             if (!response || response.success !== true) {
-                reject(
-                    new Error(
-                        response?.message ||
-                        `Falha na operação ${eventName}.`
-                    )
+
+                const error = new Error(
+                    response?.message ||
+                    `Falha na operação ${eventName}.`
                 );
 
+                error.code = response?.code;
+                error.currentEntity = response?.currentEntity ?? null;
+                error.response = response ?? null;
+
+                reject(error);
                 return;
             }
 
@@ -29020,10 +29058,15 @@ async loadSharedWorld(worldId) {
         this.world.dispose(),
         this.world = null),
         this.mobs.clear(),
+
         this.entities.clear(),
         this.particles.clear(),
         this.chests.clear(),
         this.blockEntityRevisions.clear(),
+        this.blockEntitySaveQueues.clear(),
+        this.blockEntitySaveBlocked.clear(),
+        this.pendingBlockEntityOperations.clear(),
+
         this.furnaces.clear(),
         this.saplings.clear(),
         this.mining = null
@@ -29958,7 +30001,7 @@ async loadSharedWorld(worldId) {
         this.mining = null,
         this.player.exhaustion += .005)
     }
-    breakBlock(t, e, n, s, r=!1, o=!0) {
+    breakBlock(t, e, n, s, r=!1, o=!0, blockEntityResolved=!1) {
         const a = this.world
           , l = a.getBlock(t, e, n);
         if (l === M.AIR || l === M.WATER)
@@ -29969,16 +30012,41 @@ async loadSharedWorld(worldId) {
         const h = a.getMeta(t, e, n)
           , u = this.harvestInfo(l)
           , f = s && (u.canHarvest || r);
-        if (a.setBlock(t, e, n, M.AIR, 0, !0, o),
-        l === M.OAK_DOOR) {
-            const m = h & 8 ? e - 1 : e + 1;
-            a.getBlock(t, m, n) === M.OAK_DOOR && a.setBlock(t, m, n, M.AIR, 0, !0, o)
-        } else if (l === M.BED) {
-            const m = h & 3
-              , [d,x] = Po[m]
-              , v = h & 4 ? -1 : 1;
-            a.getBlock(t + d * v, e, n + x * v) === M.BED && a.setBlock(t + d * v, e, n + x * v, M.AIR, 0, !0, o)
+          if (
+                l === M.CHEST &&
+                this.meta?.storage === "shared" &&
+                !blockEntityResolved
+            ) {
+                void this.breakSharedChest(
+                    t,
+                    e,
+                    n,
+                    s,
+                    r,
+                    o
+                );
+
+                return;
+            }
+        if (l === M.CHEST && blockEntityResolved) {
+            const wasApplyingRemote = this.applyingRemoteBlockChange;
+            this.applyingRemoteBlockChange = true;
+            a.setBlock(t, e, n, M.AIR, 0, !0, o);
+            this.applyingRemoteBlockChange = wasApplyingRemote;
+        } else {
+            a.setBlock(t, e, n, M.AIR, 0, !0, o);
         }
+
+        if (l === M.OAK_DOOR) {
+            const m = h & 8 ? e - 1 : e + 1;
+            a.getBlock(t, m, n) === M.OAK_DOOR && a.setBlock(t, m, n, M.AIR, 0, !0, o);
+        } else if (l === M.BED) {
+            const m = h & 3,
+                [d, x] = Po[m],
+                v = h & 4 ? -1 : 1;
+            a.getBlock(t + d * v, e, n + x * v) === M.BED && a.setBlock(t + d * v, e, n + x * v, M.AIR, 0, !0, o);
+        }
+
         const p = Cs(t, e, n);
         if (this.chests.has(p)) {
             for (const m of this.chests.get(p))
@@ -30097,6 +30165,19 @@ async loadSharedWorld(worldId) {
                     return !1
             }
         }
+        if (e === M.CHEST && this.meta?.storage === "shared") {
+
+            void this.placeSharedChest(
+                r,
+                o,
+                a,
+                u,
+                c.sound
+            );
+
+            return true;
+        }
+
         if (e === M.OAK_DOOR) {
             const g = n.getBlock(r, o + 1, a);
             if (g !== M.AIR && !we(g).replaceable || !Ae[h])
@@ -30150,6 +30231,12 @@ async loadSharedWorld(worldId) {
             }),
             !0;
         case M.CHEST:
+            if (this.meta?.storage === "shared") {
+
+            void this.openSharedChest(t, e, n);
+
+            return true;
+        }
             return this.chests.has(o) || this.chests.set(o, uc()),
             Zt.play("chest", {
                 x: t,
@@ -30830,6 +30917,820 @@ async loadSharedWorld(worldId) {
             this.ui.toast(
                 "Este baú foi removido por outro jogador."
             );
+        }
+    }
+
+
+    async ensureSharedChestEntity(x, y, z) {
+
+        const worldId = this.meta?.id;
+        const key = Cs(x, y, z);
+
+        if (
+            !worldId ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId
+        ) {
+            throw new Error(
+                "O mundo compartilhado não está conectado."
+            );
+        }
+
+        const revision = this.blockEntityRevisions.get(key);
+        const currentInventory = this.chests.get(key);
+
+        if (
+            Number.isSafeInteger(revision) &&
+            revision >= 1 &&
+            Array.isArray(currentInventory) &&
+            currentInventory.length === 27
+        ) {
+            return {
+                revision,
+                inventory: currentInventory
+            };
+        }
+
+        // Preserva os dados legados disponíveis no motor.
+        const legacyInventory = currentInventory
+            ? currentInventory.map(item =>
+                item ? { ...item } : null
+            )
+            : Array(27).fill(null);
+
+        const position = { x, y, z };
+        const meta = this.world.getMeta(x, y, z);
+
+        let entity = null;
+
+        try {
+
+            const response = await this.requestWorldEvent(
+                "world:block-entity:create",
+                {
+                    worldId,
+                    position,
+                    entityType: "chest",
+                    meta,
+                    migration: true,
+                    initialData: {
+                        inventory: legacyInventory
+                    }
+                }
+            );
+
+            entity = response.entity;
+
+        } catch (error) {
+
+            if (
+                error.code === "ALREADY_EXISTS" &&
+                error.currentEntity
+            ) {
+
+                entity = error.currentEntity;
+
+            } else if (error.uncertain) {
+
+                const loaded = await this.requestWorldEvent(
+                    "world:load",
+                    { worldId }
+                );
+
+                entity = loaded.blockEntities?.find(item =>
+                    item.x === x &&
+                    item.y === y &&
+                    item.z === z &&
+                    item.entity_type === "chest"
+                ) ?? null;
+
+            } else {
+
+                throw error;
+
+            }
+        }
+
+        if (
+            !entity ||
+            entity.entity_type !== "chest" ||
+            !entity.data ||
+            !Array.isArray(entity.data.inventory) ||
+            entity.data.inventory.length !== 27 ||
+            !Number.isSafeInteger(Number(entity.revision))
+        ) {
+            throw new Error(
+                "Não foi possível recuperar os dados persistidos do baú."
+            );
+        }
+
+        if (this.meta?.id !== worldId) {
+            return null;
+        }
+
+        this.applyRemoteBlockEntity({
+            worldId,
+            entity
+        });
+
+        return {
+            revision: Number(entity.revision),
+            inventory: this.chests.get(key)
+        };
+    }
+
+
+    async openSharedChest(x, y, z) {
+
+        const worldId = this.meta?.id;
+        const key = Cs(x, y, z);
+        const operationKey = `${worldId}:${key}`;
+
+        if (this.pendingBlockEntityOperations.has(operationKey)) {
+            return;
+        }
+
+        this.pendingBlockEntityOperations.add(operationKey);
+
+        try {
+
+            const result = await this.ensureSharedChestEntity(
+                x,
+                y,
+                z
+            );
+
+            if (!result || this.meta?.id !== worldId) {
+                return;
+            }
+
+            const inventory = this.chests.get(key);
+
+            if (
+                !Array.isArray(inventory) ||
+                inventory.length !== 27
+            ) {
+                throw new Error(
+                    "O inventário do baú não está disponível."
+                );
+            }
+
+            this.mining = null;
+            this.blockEntitySaveBlocked.delete(key);
+
+            this.ui.containers.openWindow(
+                "chest",
+                this.player,
+                {
+                    chest: inventory,
+                    chestKey: key
+                }
+            );
+
+            Zt.play("chest", { x, y, z });
+
+            this.input.unlock();
+
+        } catch (error) {
+
+            console.error(
+                "Erro ao abrir baú compartilhado:",
+                error
+            );
+
+            this.ui.toast(
+                error.message ||
+                "Não foi possível abrir o baú."
+            );
+
+        } finally {
+
+            this.pendingBlockEntityOperations.delete(
+                operationKey
+            );
+
+        }
+    }
+
+
+    queueChestInventorySave(key, inventory) {
+
+    
+        if (
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            !this.multiplayerWorldId ||
+            !Array.isArray(inventory) ||
+            inventory.length !== 27
+        ) {
+            return;
+        }
+
+        const worldId = this.meta.id;
+        const [x, y, z] = key.split(",").map(Number);
+
+        if (![x, y, z].every(Number.isSafeInteger)) {
+            return;
+        }
+
+        // Captura o estado exato desta movimentação.
+        const snapshot = inventory.map(item =>
+            item ? { ...item } : null
+        );
+
+        // Serializa operações para o mesmo baú.
+        const previous =
+            this.blockEntitySaveQueues.get(key) ||
+            Promise.resolve();
+
+        const task = previous
+            .catch(() => {})
+            .then(async () => {
+
+                if (this.meta?.id !== worldId) {
+                    return;
+                }
+
+                if (this.blockEntitySaveBlocked.has(key)) {
+                    return;
+                }
+
+                const expectedRevision =
+                    this.blockEntityRevisions.get(key);
+
+                if (
+                    !Number.isSafeInteger(expectedRevision) ||
+                    expectedRevision < 1
+                ) {
+                    throw new Error(
+                        "A revisão do baú não está disponível."
+                    );
+                }
+
+                const response = await this.requestWorldEvent(
+                    "world:block-entity:update",
+                    {
+                        worldId,
+                        position: { x, y, z },
+                        expectedRevision,
+                        operation: {
+                            type: "inventory:replace",
+                            inventory: snapshot
+                        }
+                    }
+                );
+
+                if (this.meta?.id !== worldId) {
+                    return;
+                }
+
+                const entity = response.entity;
+                const acknowledgedRevision =
+                    Number(entity?.revision);
+
+                if (
+                    !entity ||
+                    !Number.isSafeInteger(acknowledgedRevision)
+                ) {
+                    throw new Error(
+                        "O servidor retornou uma revisão inválida."
+                    );
+                }
+
+                const knownRevision =
+                    this.blockEntityRevisions.get(key);
+
+                // Não substitui uma atualização remota mais recente
+                // que tenha chegado antes deste ACK.
+                if (
+                    knownRevision === undefined ||
+                    acknowledgedRevision >= knownRevision
+                ) {
+
+                    const currentInventory = this.chests.get(key);
+
+                    if (
+                        currentInventory &&
+                        Array.isArray(entity.data?.inventory) &&
+                        entity.data.inventory.length === 27
+                    ) {
+                        currentInventory.splice(
+                            0,
+                            currentInventory.length,
+                            ...entity.data.inventory.map(item => br(item))
+                        );
+                    }
+
+                    this.blockEntityRevisions.set(
+                        key,
+                        acknowledgedRevision
+                    );
+                }
+
+            })
+            .catch(error => {
+
+                if (this.meta?.id !== worldId) {
+                    return;
+                }
+
+                this.blockEntitySaveBlocked.add(key);
+
+                if (
+                    error.code === "REVISION_CONFLICT" &&
+                    error.currentEntity
+                ) {
+
+                    this.applyRemoteBlockEntity({
+                        worldId,
+                        entity: error.currentEntity
+                    });
+
+                    if (
+                        this.ui.containers.kind === "chest" &&
+                        this.ui.containers.chestKey === key
+                    ) {
+                        this.ui.containers.close();
+                    }
+
+                    this.ui.toast(
+                        "Outro jogador modificou este baú. Os dados atuais foram recarregados."
+                    );
+
+                    return;
+                }
+
+                // Força uma recuperação autoritativa na próxima abertura.
+                this.blockEntityRevisions.delete(key);
+
+                if (
+                    this.ui.containers.kind === "chest" &&
+                    this.ui.containers.chestKey === key
+                ) {
+                    this.ui.containers.close();
+                }
+
+                this.ui.toast(
+                    error.message ||
+                    "Não foi possível salvar o inventário do baú."
+                );
+
+                console.error(
+                    "Erro ao salvar baú:",
+                    error
+                );
+            });
+
+        this.blockEntitySaveQueues.set(key, task);
+
+        void task.finally(() => {
+
+            if (this.blockEntitySaveQueues.get(key) === task) {
+                this.blockEntitySaveQueues.delete(key);
+            }
+
+        });
+    }
+
+
+    async placeSharedChest(x, y, z, meta, sound) {
+
+        const worldId = this.meta?.id;
+        const key = Cs(x, y, z);
+        const operationKey = `${worldId}:${key}`;
+
+        if (
+            !worldId ||
+            this.pendingBlockEntityOperations.has(operationKey) ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId
+        ) {
+            return false;
+        }
+
+        const player = this.player;
+        const inventory = player.inv;
+        const selectedSlot = inventory.selected;
+        const held = inventory.slots[selectedSlot];
+
+        if (!held || held.id !== M.CHEST || held.count < 1) {
+            return false;
+        }
+
+        const reservedItem = player.mode === "survival"
+            ? { ...held, count: 1 }
+            : null;
+
+        // Reserva o item até o servidor confirmar a colocação.
+        if (reservedItem) {
+            held.count--;
+
+            if (held.count <= 0) {
+                inventory.slots[selectedSlot] = null;
+            }
+        }
+
+        this.pendingBlockEntityOperations.add(operationKey);
+
+        const refundReservedItem = () => {
+
+            if (!reservedItem || this.player !== player) {
+                return;
+            }
+
+            const remaining = player.inv.add(reservedItem);
+
+            if (remaining > 0) {
+                this.dropStack({
+                    ...reservedItem,
+                    count: remaining
+                });
+            }
+        };
+
+        try {
+
+            const response = await this.requestWorldEvent(
+                "world:block-entity:create",
+                {
+                    worldId,
+                    position: { x, y, z },
+                    entityType: "chest",
+                    meta
+                }
+            );
+
+            if (this.meta?.id !== worldId) {
+                return true;
+            }
+
+            // O servidor já gravou o bloco fisicamente.
+            // Atualizamos a cópia local sem gerar outro envio.
+            this.applyRemoteBlockChanges({
+                worldId,
+                changes: [{
+                    x,
+                    y,
+                    z,
+                    blockId: M.CHEST,
+                    meta
+                }]
+            });
+
+            this.applyRemoteBlockEntity({
+                worldId,
+                entity: response.entity
+            });
+
+            Zt.blockSound(sound, "place", {
+                x: x + .5,
+                y: y + .5,
+                z: z + .5
+            });
+
+            return true;
+
+        } catch (error) {
+
+            let existingEntity = error.currentEntity ?? null;
+            let uncertainCreation = !!error.uncertain;
+            let reconciliationCompleted = false;
+
+            if (uncertainCreation) {
+
+                try {
+
+                    const loaded = await this.requestWorldEvent(
+                        "world:load",
+                        { worldId }
+                    );
+
+                    reconciliationCompleted = true;
+
+                    existingEntity = loaded.blockEntities?.find(entity =>
+                        entity.x === x &&
+                        entity.y === y &&
+                        entity.z === z &&
+                        entity.entity_type === "chest"
+                    ) ?? null;
+
+                } catch {}
+
+            }
+
+            if (
+                existingEntity?.entity_type === "chest" &&
+                Array.isArray(existingEntity.data?.inventory) &&
+                existingEntity.data.inventory.length === 27
+            ) {
+
+                this.applyRemoteBlockChanges({
+                    worldId,
+                    changes: [{
+                        x,
+                        y,
+                        z,
+                        blockId: M.CHEST,
+                        meta
+                    }]
+                });
+
+                this.applyRemoteBlockEntity({
+                    worldId,
+                    entity: existingEntity
+                });
+
+                if (!uncertainCreation) {
+                    refundReservedItem();
+                }
+
+            } else if (
+                !uncertainCreation ||
+                reconciliationCompleted
+            ) {
+
+                refundReservedItem();
+
+            } else {
+
+                // Não devolvemos o item enquanto não soubermos
+                // se a transação foi confirmada.
+                this.ui.toast(
+                    "Não foi possível confirmar a colocação. Confira o mundo após reconectar."
+                );
+
+            }
+
+            console.error(
+                "Erro ao colocar baú compartilhado:",
+                error
+            );
+
+            this.ui.toast(
+                error.message ||
+                "Não foi possível colocar o baú."
+            );
+
+            return false;
+
+        } finally {
+
+            this.pendingBlockEntityOperations.delete(
+                operationKey
+            );
+
+        }
+    }
+
+
+    async breakSharedChest(
+        x,
+        y,
+        z,
+        canHarvest,
+        instant,
+        remesh
+     ) {
+
+        const worldId = this.meta?.id;
+        const key = Cs(x, y, z);
+        const operationKey = `${worldId}:${key}`;
+
+        if (
+            !worldId ||
+            this.pendingBlockEntityOperations.has(operationKey) ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId
+        ) {
+            return;
+        }
+
+        this.pendingBlockEntityOperations.add(operationKey);
+
+        try {
+
+            // Espera a última gravação do inventário.
+            const pendingSave = this.blockEntitySaveQueues.get(key);
+
+            if (pendingSave) {
+                await pendingSave;
+            }
+
+            // Recupera a revisão e o inventário autoritativos.
+            const prepared = await this.ensureSharedChestEntity(
+                x,
+                y,
+                z
+            );
+
+            if (!prepared || this.meta?.id !== worldId) {
+                return;
+            }
+
+            const expectedRevision =
+                this.blockEntityRevisions.get(key);
+
+            if (
+                !Number.isSafeInteger(expectedRevision) ||
+                expectedRevision < 1
+            ) {
+                throw new Error(
+                    "A revisão do baú não está disponível."
+                );
+            }
+
+            const response = await this.requestWorldEvent(
+                "world:block-entity:remove",
+                {
+                    worldId,
+                    position: { x, y, z },
+                    expectedRevision
+                }
+            );
+
+            if (this.meta?.id !== worldId) {
+                return;
+            }
+
+            // O inventário vem da entidade removida no PostgreSQL.
+            const removedInventory = response.entity?.data?.inventory;
+
+            if (
+                !Array.isArray(removedInventory) ||
+                removedInventory.length !== 27
+            ) {
+                throw new Error(
+                    "O servidor não retornou o inventário persistido."
+                );
+            }
+
+            const localInventory = this.chests.get(key);
+
+            if (localInventory) {
+
+                localInventory.splice(
+                    0,
+                    localInventory.length,
+                    ...removedInventory.map(item => br(item))
+                );
+
+            } else {
+
+                this.chests.set(
+                    key,
+                    removedInventory.map(item => br(item))
+                );
+
+            }
+
+            if (
+                this.ui.containers.kind === "chest" &&
+                this.ui.containers.chestKey === key
+            ) {
+                this.ui.containers.close();
+            }
+
+            this.blockEntityRevisions.delete(key);
+            this.blockEntitySaveBlocked.delete(key);
+
+            // Executa o comportamento original de quebra.
+            // O bloco AIR já foi salvo pelo servidor.
+            this.breakBlock(
+                x,
+                y,
+                z,
+                canHarvest,
+                instant,
+                remesh,
+                true
+            );
+
+        } catch (error) {
+
+            if (error.uncertain && this.meta?.id === worldId) {
+
+                // Reconciliação após timeout: consulta novamente
+                // a entidade e o estado físico do bloco.
+                try {
+
+                    const loaded = await this.requestWorldEvent(
+                        "world:load",
+                        { worldId }
+                    );
+
+                    const entityStillExists =
+                        loaded.blockEntities?.some(entity =>
+                            entity.x === x &&
+                            entity.y === y &&
+                            entity.z === z
+                        );
+
+                    const chunkX = Math.floor(x / 16);
+                    const chunkZ = Math.floor(z / 16);
+
+                    const localX = x - chunkX * 16;
+                    const localZ = z - chunkZ * 16;
+
+                    const index =
+                        localX +
+                        localZ * 16 +
+                        y * 256;
+
+                    const chunk = loaded.chunks?.find(item =>
+                        Number(item.chunk_x) === chunkX &&
+                        Number(item.chunk_y ?? 0) === 0 &&
+                        Number(item.chunk_z) === chunkZ
+                    );
+
+                    const savedBlock = chunk?.chunk_data?.find(
+                        entry =>
+                            Array.isArray(entry) &&
+                            entry[0] === index
+                    );
+
+                    const removalConfirmed =
+                        !entityStillExists &&
+                        Array.isArray(savedBlock) &&
+                        (savedBlock[1] & 255) === 0;
+
+                    if (
+                        removalConfirmed &&
+                        this.meta?.id === worldId
+                    ) {
+
+                        this.blockEntityRevisions.delete(key);
+
+                        this.breakBlock(
+                            x,
+                            y,
+                            z,
+                            canHarvest,
+                            instant,
+                            remesh,
+                            true
+                        );
+
+                        return;
+                    }
+
+                    const currentEntity =
+                        loaded.blockEntities?.find(entity =>
+                            entity.x === x &&
+                            entity.y === y &&
+                            entity.z === z
+                        );
+
+                    if (currentEntity) {
+                        this.applyRemoteBlockEntity({
+                            worldId,
+                            entity: currentEntity
+                        });
+                    }
+
+                } catch (reconcileError) {
+
+                    console.error(
+                        "Não foi possível confirmar a remoção do baú:",
+                        reconcileError
+                    );
+
+                }
+            }
+
+            if (
+                error.code === "REVISION_CONFLICT" &&
+                error.currentEntity
+            ) {
+
+                this.applyRemoteBlockEntity({
+                    worldId,
+                    entity: error.currentEntity
+                });
+
+                this.ui.toast(
+                    "Outro jogador modificou o baú. Os dados foram atualizados; tente quebrá-lo novamente."
+                );
+
+            } else {
+
+                console.error(
+                    "Erro ao quebrar baú compartilhado:",
+                    error
+                );
+
+                this.ui.toast(
+                    error.message ||
+                    "Não foi possível quebrar o baú."
+                );
+
+            }
+
+        } finally {
+
+            this.pendingBlockEntityOperations.delete(
+                operationKey
+            );
+
         }
     }
 
