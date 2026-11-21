@@ -71,12 +71,31 @@ const io = new Server(httpServer, {
 // Estrutura: Map<worldId, Map<socketId, player>>
 const worlds = new Map();
 
+// Cooldown de geração por mundo, não por conexão. Assim, uma reconexão ou
+// troca de autoridade não reinicia o limite durante a vida do processo.
+const worldAnimalSpawnCooldowns = new Map();
+
 function getWorld(worldId) {
     if (!worlds.has(worldId)) {
         worlds.set(worldId, new Map());
     }
 
     return worlds.get(worldId);
+}
+
+
+function getWorldAnimalAuthorityId(world) {
+    if (!world || world.size === 0) {
+        return null;
+    }
+
+    const onlineIds = Array.from(world.keys()).sort();
+
+    if (world.ownerId && onlineIds.includes(world.ownerId)) {
+        return world.ownerId;
+    }
+
+    return onlineIds[0] ?? null;
 }
 
 function sanitizeName(name) {
@@ -858,6 +877,211 @@ const WorldEntityRegistry = {
 };
 
 
+// Contrato v1 dos animais existentes no motor.
+// Os valores máximos de vida espelham Eg em motor.js e devem permanecer
+// alinhados até que uma futura versão de dados introduza atributos novos.
+const WORLD_ANIMAL_ENTITY_HEALTH = Object.freeze({
+    cow: 10,
+    pig: 10,
+    sheep: 8,
+    chicken: 4
+});
+
+
+function registerAnimalWorldEntity(type, maxHealth) {
+    WorldEntityRegistry.register(type, {
+        dataVersion: 1,
+
+        createDefault() {
+            return {
+                health: maxHealth
+            };
+        },
+
+        validateData(data, dataVersion) {
+            if (dataVersion !== 1) {
+                throw createWorldEntityError(
+                    `Versão de dados incompatível para o animal ${type}.`,
+                    "UNSUPPORTED_ENTITY_VERSION"
+                );
+            }
+
+            if (
+                !isPlainObject(data) ||
+                Object.keys(data).some(field => field !== "health") ||
+                typeof data.health !== "number" ||
+                !Number.isFinite(data.health) ||
+                data.health < 0 ||
+                data.health > maxHealth
+            ) {
+                throw createWorldEntityError(
+                    `A vida persistida do animal ${type} é inválida.`,
+                    "INVALID_ENTITY_DATA"
+                );
+            }
+
+            return {
+                health: data.health
+            };
+        },
+
+        // Operações de estado ainda não são expostas aos clientes nesta etapa.
+        // A próxima etapa definirá as mutações autoritativas (dano, morte etc.).
+        // Atualizações de transformação continuam permitidas pelo CRUD genérico.
+        applyOperation() {
+            throw createWorldEntityError(
+                `Operações de estado para ${type} ainda não estão disponíveis.`,
+                "UNSUPPORTED_ENTITY_OPERATION"
+            );
+        }
+    });
+}
+
+
+for (const [type, maxHealth] of Object.entries(WORLD_ANIMAL_ENTITY_HEALTH)) {
+    registerAnimalWorldEntity(type, maxHealth);
+}
+
+
+const WORLD_ANIMAL_ENTITY_LIMIT = 10;
+const WORLD_ANIMAL_SPAWN_COOLDOWN_MS = 10000;
+const WORLD_ANIMAL_MOVE_INTERVAL_MS = 80;
+const WORLD_ANIMAL_CHECKPOINT_INTERVAL_MS = 4000;
+
+
+async function migrateLegacyWorldAnimals(client, worldId, settings) {
+    if (
+        !isPlainObject(settings) ||
+        !Array.isArray(settings.animals) ||
+        settings.animals.length === 0
+    ) {
+        return { migrated: 0, skipped: 0, entities: [] };
+    }
+
+    const migratedEntities = [];
+    let skipped = 0;
+
+    for (const legacyAnimal of settings.animals) {
+        if (!isPlainObject(legacyAnimal)) {
+            skipped++;
+            continue;
+        }
+
+        const type = legacyAnimal.t;
+        const maxHealth = WORLD_ANIMAL_ENTITY_HEALTH[type];
+        const health = legacyAnimal.h === undefined
+            ? maxHealth
+            : legacyAnimal.h;
+
+        if (
+            !maxHealth ||
+            ![legacyAnimal.x, legacyAnimal.y, legacyAnimal.z, health]
+                .every(value => typeof value === "number" && Number.isFinite(value)) ||
+            health <= 0 ||
+            health > maxHealth
+        ) {
+            skipped++;
+            continue;
+        }
+
+        let transform;
+        let data;
+
+        try {
+            transform = normalizeWorldEntityTransform({
+                position: {
+                    x: legacyAnimal.x,
+                    y: legacyAnimal.y,
+                    z: legacyAnimal.z
+                },
+                yaw: 0,
+                velocity: { x: 0, y: 0, z: 0 }
+            });
+
+            data = validateRegisteredWorldEntityData(
+                WorldEntityRegistry.get(type),
+                { health },
+                1
+            );
+        } catch {
+            skipped++;
+            continue;
+        }
+
+        const insertResult = await client.query(
+            `
+            INSERT INTO world_entities (
+                id,
+                world_id,
+                entity_type,
+                data_version,
+                position_x,
+                position_y,
+                position_z,
+                yaw,
+                velocity_x,
+                velocity_y,
+                velocity_z,
+                data,
+                revision,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, 1, $4, $5, $6,
+                $7, $8, $9, $10, $11::jsonb, 1, NOW(), NOW()
+            )
+            RETURNING *
+            `,
+            [
+                randomUUID(),
+                worldId,
+                type,
+                transform.position_x,
+                transform.position_y,
+                transform.position_z,
+                transform.yaw,
+                transform.velocity_x,
+                transform.velocity_y,
+                transform.velocity_z,
+                JSON.stringify(data)
+            ]
+        );
+
+        migratedEntities.push(publicWorldEntity(insertResult.rows[0]));
+    }
+
+    // Limpa o formato antigo na mesma transação dos INSERTs.
+    // Se qualquer INSERT falhar, o rollback restaura settings.animals,
+    // impedindo perda de dados ou migração parcial.
+    const nextSettings = {
+        ...settings,
+        animals: []
+    };
+
+    await client.query(
+        `
+        UPDATE worlds
+        SET settings = $2::jsonb,
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [worldId, JSON.stringify(nextSettings)]
+    );
+
+    console.log(
+        `Migração de animais legados do mundo ${worldId}: ` +
+        `${migratedEntities.length} migrados, ${skipped} ignorados.`
+    );
+
+    return {
+        migrated: migratedEntities.length,
+        skipped,
+        entities: migratedEntities
+    };
+}
+
+
 function validateRegisteredWorldEntityData(definition, data, dataVersion) {
     let validatedData;
 
@@ -1553,6 +1777,7 @@ io.on("connection", (socket) => {
             // 7. Recupera ou cria a estrutura em memória.
 
             const world = getWorld(worldId);
+            world.ownerId = worldRecord.owner_id;
 
 
             // 8. Cria a representação do jogador.
@@ -2886,10 +3111,66 @@ io.on("connection", (socket) => {
 
             client = await pool.connect();
 
+            // Migração legada serializada pelo registro do mundo.
+            // A transação curta usa READ COMMITTED para que um segundo
+            // carregamento concorrente veja settings.animals já limpo após
+            // aguardar o primeiro carregamento concluir a migração.
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            const migrationWorldResult = await client.query(
+                `
+                SELECT
+                    w.id,
+                    w.settings
+                FROM worlds w
+                WHERE
+                    w.id = $1
+                    AND (
+                        w.owner_id = $2
+                        OR w.visibility = 'public'
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+                FOR UPDATE OF w
+                `,
+                [worldId, userId]
+            );
+
+            if (migrationWorldResult.rows.length === 0) {
+                throw createRequestError(
+                    "Mundo não encontrado ou você não possui acesso."
+                );
+            }
+
+            const migrationResult = await migrateLegacyWorldAnimals(
+                client,
+                worldId,
+                migrationWorldResult.rows[0].settings
+            );
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            // Os clientes já presentes no mundo recebem os registros migrados
+            // somente depois de o COMMIT confirmar sua gravação.
+            for (const entity of migrationResult.entities) {
+                socket.to(worldId).emit("world:entity:created", {
+                    worldId,
+                    entity
+                });
+            }
+
+            // A leitura principal mantém o snapshot consistente entre
+            // mundo, chunks, Block Entities, World Entities e jogador.
             await client.query(
                 "BEGIN ISOLATION LEVEL REPEATABLE READ"
             );
-
             transactionStarted = true;
 
             // Verifica se a conta é proprietária,
@@ -3759,6 +4040,13 @@ io.on("connection", (socket) => {
                 );
             }
 
+            if (WORLD_ANIMAL_ENTITY_HEALTH[entityType]) {
+                throw createWorldEntityError(
+                    "Animais devem ser criados pelo fluxo de geração autorizado do mundo.",
+                    "ANIMAL_CREATE_REQUIRES_AUTHORITY"
+                );
+            }
+
             const transform = normalizeWorldEntityTransform(
                 payload.transform
             );
@@ -3859,6 +4147,684 @@ io.on("connection", (socket) => {
             );
 
         } finally {
+            client?.release();
+        }
+    });
+
+
+    // Geração de grupos de animais persistentes.
+    // Só o proprietário online (ou, na ausência dele, o menor UUID online)
+    // pode solicitar o spawn. O lock do mundo impede ultrapassar o limite
+    // mesmo que dois clientes tentem simultaneamente.
+    socket.on("world:animals:spawn", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+        let spawnGuardAcquired = false;
+
+        try {
+            if (!isPlainObject(payload) || !Array.isArray(payload.animals)) {
+                throw createWorldEntityError(
+                    "Dados de geração dos animais inválidos."
+                );
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+
+            if (
+                payload.animals.length < 1 ||
+                payload.animals.length > 4
+            ) {
+                throw createWorldEntityError(
+                    "O grupo de animais informado é inválido."
+                );
+            }
+
+            // Reserva a conexão antes do primeiro await. Duas chamadas emitidas
+            // quase simultaneamente pela mesma conexão não passam juntas.
+            if (socket.data.animalSpawnInFlight) {
+                throw createWorldEntityError(
+                    "Já existe uma geração de animais em andamento.",
+                    "ANIMAL_SPAWN_PENDING"
+                );
+            }
+
+            socket.data.animalSpawnInFlight = true;
+            spawnGuardAcquired = true;
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            const worldResult = await client.query(
+                `
+                SELECT w.owner_id
+                FROM worlds w
+                WHERE
+                    w.id = $1
+                    AND (
+                        w.owner_id = $2
+                        OR w.visibility = 'public'
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+                FOR UPDATE OF w
+                `,
+                [worldId, userId]
+            );
+
+            if (worldResult.rows.length === 0) {
+                throw createWorldEntityError(
+                    "Você não possui autorização para gerar animais neste mundo.",
+                    "WORLD_ACCESS_DENIED"
+                );
+            }
+
+            const activeWorld = worlds.get(worldId);
+            const activePlayer = activeWorld?.get(userId);
+
+            if (!activePlayer || activePlayer.socketId !== socket.id) {
+                throw createWorldEntityError(
+                    "A sessão do jogador não está mais ativa neste mundo.",
+                    "INVALID_SESSION"
+                );
+            }
+
+            activeWorld.ownerId = worldResult.rows[0].owner_id;
+
+            if (getWorldAnimalAuthorityId(activeWorld) !== userId) {
+                throw createWorldEntityError(
+                    "Somente a autoridade atual do mundo pode gerar animais.",
+                    "WORLD_ENTITY_SPAWN_AUTHORITY"
+                );
+            }
+
+            // A verificação ocorre depois do lock da linha do mundo. Assim,
+            // transações concorrentes são serializadas e consultam um cooldown
+            // compartilhado por mundo, mesmo após troca de conexão/autoridade.
+            const now = Date.now();
+
+            for (const [cooldownWorldId, timestamp] of worldAnimalSpawnCooldowns) {
+                if (now - timestamp >= WORLD_ANIMAL_SPAWN_COOLDOWN_MS) {
+                    worldAnimalSpawnCooldowns.delete(cooldownWorldId);
+                }
+            }
+
+            const lastSpawn = Number(worldAnimalSpawnCooldowns.get(worldId)) || 0;
+
+            if (now - lastSpawn < WORLD_ANIMAL_SPAWN_COOLDOWN_MS) {
+                throw createWorldEntityError(
+                    "A geração de animais está temporariamente limitada.",
+                    "ANIMAL_SPAWN_COOLDOWN"
+                );
+            }
+
+            const countResult = await client.query(
+                `
+                SELECT COUNT(*)::int AS count
+                FROM world_entities
+                WHERE
+                    world_id = $1
+                    AND entity_type = ANY($2::text[])
+                `,
+                [worldId, Object.keys(WORLD_ANIMAL_ENTITY_HEALTH)]
+            );
+
+            const currentCount = Number(countResult.rows[0]?.count) || 0;
+            const availableSlots = Math.max(
+                0,
+                WORLD_ANIMAL_ENTITY_LIMIT - currentCount
+            );
+
+            if (availableSlots === 0) {
+                await client.query("COMMIT");
+                transactionStarted = false;
+
+                if (typeof ack === "function") {
+                    ack({ success: true, entities: [], spawned: 0 });
+                }
+
+                return;
+            }
+
+            const acceptedAnimals = [];
+
+            for (const candidate of payload.animals) {
+                if (acceptedAnimals.length >= Math.min(4, availableSlots)) {
+                    break;
+                }
+
+                if (
+                    !isPlainObject(candidate) ||
+                    Object.keys(candidate).some(field =>
+                        !["entityType", "position", "yaw"].includes(field)
+                    )
+                ) {
+                    throw createWorldEntityError(
+                        "Um animal do grupo contém campos inválidos."
+                    );
+                }
+
+                const entityType = candidate.entityType;
+                const definition = WorldEntityRegistry.get(entityType);
+
+                if (!definition || !WORLD_ANIMAL_ENTITY_HEALTH[entityType]) {
+                    throw createWorldEntityError(
+                        "Tipo de animal não permitido para geração.",
+                        "UNKNOWN_ENTITY_TYPE"
+                    );
+                }
+
+                const transform = normalizeWorldEntityTransform({
+                    position: candidate.position,
+                    yaw: candidate.yaw ?? 0,
+                    velocity: { x: 0, y: 0, z: 0 }
+                });
+
+                const distanceFromAuthority = Math.hypot(
+                    transform.position_x - Number(activePlayer.position?.x ?? 0),
+                    transform.position_z - Number(activePlayer.position?.z ?? 0)
+                );
+
+                if (distanceFromAuthority > 80) {
+                    throw createWorldEntityError(
+                        "O ponto de geração está distante demais do jogador autorizado."
+                    );
+                }
+
+                acceptedAnimals.push({ entityType, transform, definition });
+            }
+
+            const createdEntities = [];
+
+            for (const animal of acceptedAnimals) {
+                const entityId = randomUUID();
+                const initialData = validateRegisteredWorldEntityData(
+                    animal.definition,
+                    animal.definition.createDefault(),
+                    animal.definition.dataVersion
+                );
+
+                const result = await client.query(
+                    `
+                    INSERT INTO world_entities (
+                        id,
+                        world_id,
+                        entity_type,
+                        data_version,
+                        position_x,
+                        position_y,
+                        position_z,
+                        yaw,
+                        velocity_x,
+                        velocity_y,
+                        velocity_z,
+                        data,
+                        revision,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        $8, $9, $10, $11, $12::jsonb, 1, NOW(), NOW()
+                    )
+                    RETURNING *
+                    `,
+                    [
+                        entityId,
+                        worldId,
+                        animal.entityType,
+                        animal.definition.dataVersion,
+                        animal.transform.position_x,
+                        animal.transform.position_y,
+                        animal.transform.position_z,
+                        animal.transform.yaw,
+                        animal.transform.velocity_x,
+                        animal.transform.velocity_y,
+                        animal.transform.velocity_z,
+                        validateWorldEntityDataSize(initialData)
+                    ]
+                );
+
+                createdEntities.push(publicWorldEntity(result.rows[0]));
+            }
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            if (createdEntities.length > 0) {
+                worldAnimalSpawnCooldowns.set(worldId, Date.now());
+
+                for (const entity of createdEntities) {
+                    socket.to(worldId).emit("world:entity:created", {
+                        worldId,
+                        entity
+                    });
+                }
+            }
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entities: createdEntities,
+                    spawned: createdEntities.length
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro ao reverter geração de animais:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendWorldEntitySocketError(
+                ack,
+                error,
+                "Não foi possível gerar os animais."
+            );
+
+        } finally {
+            if (spawnGuardAcquired) {
+                socket.data.animalSpawnInFlight = false;
+            }
+
+            client?.release();
+        }
+    });
+
+
+    // Movimento em tempo real dos animais persistentes.
+    // Este evento somente retransmite snapshots; não grava no PostgreSQL.
+    socket.on("world:animals:move", (payload = {}) => {
+        try {
+            if (
+                !isPlainObject(payload) ||
+                !Array.isArray(payload.animals) ||
+                payload.animals.length < 1 ||
+                payload.animals.length > WORLD_ANIMAL_ENTITY_LIMIT
+            ) {
+                return;
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+            const activeWorld = worlds.get(worldId);
+
+            if (getWorldAnimalAuthorityId(activeWorld) !== userId) {
+                return;
+            }
+
+            const now = Date.now();
+
+            if (
+                now - (Number(socket.data.lastAnimalMovementAt) || 0) <
+                WORLD_ANIMAL_MOVE_INTERVAL_MS
+            ) {
+                return;
+            }
+
+            const seenIds = new Set();
+            const animals = [];
+
+            for (const update of payload.animals) {
+                if (
+                    !isPlainObject(update) ||
+                    Object.keys(update).some(field =>
+                        !["id", "revision", "position", "yaw", "velocity"].includes(field)
+                    )
+                ) {
+                    return;
+                }
+
+                const id = normalizeWorldEntityId(update.id);
+                const revision = update.revision;
+
+                if (
+                    seenIds.has(id) ||
+                    !Number.isSafeInteger(revision) ||
+                    revision < 1
+                ) {
+                    return;
+                }
+
+                seenIds.add(id);
+
+                const transform = normalizeWorldEntityTransform({
+                    position: update.position,
+                    yaw: update.yaw,
+                    velocity: update.velocity
+                });
+
+                animals.push({
+                    id,
+                    revision,
+                    position: {
+                        x: transform.position_x,
+                        y: transform.position_y,
+                        z: transform.position_z
+                    },
+                    yaw: transform.yaw,
+                    velocity: {
+                        x: transform.velocity_x,
+                        y: transform.velocity_y,
+                        z: transform.velocity_z
+                    }
+                });
+            }
+
+            socket.data.lastAnimalMovementAt = now;
+
+            socket.to(worldId).emit("world:animals:moved", {
+                worldId,
+                animals
+            });
+        } catch (error) {
+            // Pacotes inválidos não são retransmitidos. O checkpoint persistente
+            // continua sendo validado separadamente e não confia neste evento.
+        }
+    });
+
+
+    // Checkpoint periódico do movimento dos animais.
+    // Uma única transação persiste o lote; broadcasts só acontecem após COMMIT.
+    socket.on("world:animals:checkpoint", async (payload = {}, ack) => {
+        let client;
+        let transactionStarted = false;
+        let checkpointGuardAcquired = false;
+
+        try {
+            if (
+                !isPlainObject(payload) ||
+                !Array.isArray(payload.animals) ||
+                payload.animals.length < 1 ||
+                payload.animals.length > WORLD_ANIMAL_ENTITY_LIMIT
+            ) {
+                throw createWorldEntityError(
+                    "Lote de checkpoint dos animais inválido."
+                );
+            }
+
+            const worldId = payload.worldId;
+            const userId = validateWorldEntitySession(socket, worldId);
+
+            if (socket.data.animalCheckpointInFlight) {
+                throw createWorldEntityError(
+                    "Já existe um checkpoint de animais em andamento.",
+                    "ANIMAL_CHECKPOINT_PENDING"
+                );
+            }
+
+            socket.data.animalCheckpointInFlight = true;
+            checkpointGuardAcquired = true;
+
+            client = await pool.connect();
+            await client.query("BEGIN");
+            transactionStarted = true;
+
+            const worldResult = await client.query(
+                `
+                SELECT w.owner_id
+                FROM worlds w
+                WHERE
+                    w.id = $1
+                    AND (
+                        w.owner_id = $2
+                        OR w.visibility = 'public'
+                        OR EXISTS (
+                            SELECT 1
+                            FROM world_members wm
+                            WHERE
+                                wm.world_id = w.id
+                                AND wm.user_id = $2
+                        )
+                    )
+                FOR UPDATE OF w
+                `,
+                [worldId, userId]
+            );
+
+            if (worldResult.rows.length === 0) {
+                throw createWorldEntityError(
+                    "Você não possui autorização para persistir animais neste mundo.",
+                    "WORLD_ACCESS_DENIED"
+                );
+            }
+
+            const activeWorld = worlds.get(worldId);
+            const activePlayer = activeWorld?.get(userId);
+
+            if (!activePlayer || activePlayer.socketId !== socket.id) {
+                throw createWorldEntityError(
+                    "A sessão do jogador não está mais ativa neste mundo.",
+                    "INVALID_SESSION"
+                );
+            }
+
+            activeWorld.ownerId = worldResult.rows[0].owner_id;
+
+            if (getWorldAnimalAuthorityId(activeWorld) !== userId) {
+                throw createWorldEntityError(
+                    "Somente a autoridade atual pode persistir o movimento dos animais.",
+                    "WORLD_ENTITY_SPAWN_AUTHORITY"
+                );
+            }
+
+            const lastCheckpoint =
+                socket.data.lastAnimalCheckpointWorldId === worldId
+                    ? Number(socket.data.lastAnimalCheckpointAt) || 0
+                    : 0;
+
+            if (Date.now() - lastCheckpoint < WORLD_ANIMAL_CHECKPOINT_INTERVAL_MS) {
+                throw createWorldEntityError(
+                    "O próximo checkpoint dos animais ainda não está liberado.",
+                    "ANIMAL_CHECKPOINT_COOLDOWN"
+                );
+            }
+
+            const seenIds = new Set();
+            const updates = payload.animals.map(update => {
+                if (
+                    !isPlainObject(update) ||
+                    Object.keys(update).some(field =>
+                        !["id", "expectedRevision", "transform"].includes(field)
+                    ) ||
+                    !isPlainObject(update.transform) ||
+                    !Object.prototype.hasOwnProperty.call(update.transform, "position") ||
+                    !Object.prototype.hasOwnProperty.call(update.transform, "yaw") ||
+                    !Object.prototype.hasOwnProperty.call(update.transform, "velocity") ||
+                    !Number.isSafeInteger(update.expectedRevision) ||
+                    update.expectedRevision < 1
+                ) {
+                    throw createWorldEntityError(
+                        "Um checkpoint contém campos ou revisão inválidos."
+                    );
+                }
+
+                const id = normalizeWorldEntityId(update.id);
+
+                if (seenIds.has(id)) {
+                    throw createWorldEntityError(
+                        "O lote contém uma entidade duplicada."
+                    );
+                }
+
+                seenIds.add(id);
+
+                return {
+                    id,
+                    expectedRevision: update.expectedRevision,
+                    transform: update.transform
+                };
+            }).sort((a, b) => a.id.localeCompare(b.id));
+
+            const updatedEntities = [];
+
+            for (const update of updates) {
+                const entityResult = await client.query(
+                    `
+                    SELECT *
+                    FROM world_entities
+                    WHERE world_id = $1 AND id = $2
+                    FOR UPDATE
+                    `,
+                    [worldId, update.id]
+                );
+
+                const storedEntity = entityResult.rows[0];
+
+                if (
+                    !storedEntity ||
+                    !WORLD_ANIMAL_ENTITY_HEALTH[storedEntity.entity_type]
+                ) {
+                    throw createWorldEntityError(
+                        "O animal do checkpoint não existe neste mundo.",
+                        "ANIMAL_NOT_FOUND"
+                    );
+                }
+
+                const definition = WorldEntityRegistry.get(
+                    storedEntity.entity_type
+                );
+
+                if (
+                    !definition ||
+                    Number(storedEntity.data_version) !== definition.dataVersion
+                ) {
+                    throw createWorldEntityError(
+                        "A versão persistida do animal não é compatível.",
+                        "UNSUPPORTED_ENTITY_VERSION"
+                    );
+                }
+
+                validateRegisteredWorldEntityData(
+                    definition,
+                    storedEntity.data,
+                    Number(storedEntity.data_version)
+                );
+
+                const currentEntity = publicWorldEntity(storedEntity);
+
+                if (currentEntity.revision !== update.expectedRevision) {
+                    throw createWorldEntityError(
+                        "O animal foi atualizado por outra operação. Recarregue o estado antes de persistir novamente.",
+                        "REVISION_CONFLICT",
+                        currentEntity
+                    );
+                }
+
+                const transform = normalizeWorldEntityTransform(
+                    update.transform,
+                    storedEntity
+                );
+
+                const distanceFromAuthority = Math.hypot(
+                    transform.position_x - Number(activePlayer.position?.x ?? 0),
+                    transform.position_z - Number(activePlayer.position?.z ?? 0)
+                );
+
+                if (distanceFromAuthority > 180) {
+                    throw createWorldEntityError(
+                        "O animal está distante demais da autoridade para receber checkpoint."
+                    );
+                }
+
+                const updateResult = await client.query(
+                    `
+                    UPDATE world_entities
+                    SET
+                        position_x = $3,
+                        position_y = $4,
+                        position_z = $5,
+                        yaw = $6,
+                        velocity_x = $7,
+                        velocity_y = $8,
+                        velocity_z = $9,
+                        revision = revision + 1,
+                        updated_at = NOW()
+                    WHERE
+                        world_id = $1
+                        AND id = $2
+                        AND revision = $10
+                    RETURNING *
+                    `,
+                    [
+                        worldId,
+                        update.id,
+                        transform.position_x,
+                        transform.position_y,
+                        transform.position_z,
+                        transform.yaw,
+                        transform.velocity_x,
+                        transform.velocity_y,
+                        transform.velocity_z,
+                        update.expectedRevision
+                    ]
+                );
+
+                if (updateResult.rows.length === 0) {
+                    throw createWorldEntityError(
+                        "O animal foi atualizado por outra operação. Recarregue o estado antes de persistir novamente.",
+                        "REVISION_CONFLICT",
+                        currentEntity
+                    );
+                }
+
+                updatedEntities.push(publicWorldEntity(updateResult.rows[0]));
+            }
+
+            await client.query("COMMIT");
+            transactionStarted = false;
+            socket.data.lastAnimalCheckpointAt = Date.now();
+            socket.data.lastAnimalCheckpointWorldId = worldId;
+
+            for (const entity of updatedEntities) {
+                socket.to(worldId).emit("world:entity:updated", {
+                    worldId,
+                    entity
+                });
+            }
+
+            if (typeof ack === "function") {
+                ack({
+                    success: true,
+                    entities: updatedEntities
+                });
+            }
+
+        } catch (error) {
+            if (client && transactionStarted) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch (rollbackError) {
+                    console.error(
+                        "Erro ao reverter checkpoint dos animais:",
+                        rollbackError
+                    );
+                }
+            }
+
+            sendWorldEntitySocketError(
+                ack,
+                error,
+                "Não foi possível persistir o movimento dos animais."
+            );
+
+        } finally {
+            if (checkpointGuardAcquired) {
+                socket.data.animalCheckpointInFlight = false;
+            }
+
             client?.release();
         }
     });
@@ -4039,6 +5005,13 @@ io.on("connection", (socket) => {
                 throw createWorldEntityError(
                     "A entidade não existe neste mundo.",
                     "NOT_FOUND"
+                );
+            }
+
+            if (WORLD_ANIMAL_ENTITY_HEALTH[storedEntity.entity_type]) {
+                throw createWorldEntityError(
+                    "A movimentação e o estado dos animais ainda não possuem autoridade multiplayer nesta etapa.",
+                    "ANIMAL_AUTHORITY_NOT_READY"
                 );
             }
 
@@ -4237,6 +5210,13 @@ io.on("connection", (socket) => {
                 throw createWorldEntityError(
                     "A entidade não existe neste mundo.",
                     "NOT_FOUND"
+                );
+            }
+
+            if (WORLD_ANIMAL_ENTITY_HEALTH[storedEntity.entity_type]) {
+                throw createWorldEntityError(
+                    "A remoção dos animais será controlada pelo ciclo de vida autoritativo.",
+                    "ANIMAL_LIFECYCLE_NOT_READY"
                 );
             }
 

@@ -25165,9 +25165,108 @@ const Eg = {
         drops: i => [[at.STRING, Math.floor(i() * 3)], ...i() < .1 ? [[at.FEATHER, 1]] : []]
     }
 };
+
+// Contrato de persistência de mobs (World Entity data_version = 1).
+// A transformação fica nas colunas próprias de world_entities;
+// o JSONB contém somente o estado durável específico do mob.
+// Nesta versão, o único atributo persistido é health.
+const MOB_WORLD_ENTITY_DATA_VERSION = 1;
+const MOB_WORLD_ENTITY_TYPES = new Set(["cow", "pig", "sheep", "chicken"]);
+
+function normalizeMobWorldEntityData(type, data, dataVersion = MOB_WORLD_ENTITY_DATA_VERSION) {
+    const definition = Eg[type];
+
+    if (
+        !definition ||
+        dataVersion !== MOB_WORLD_ENTITY_DATA_VERSION ||
+        !data ||
+        typeof data !== "object" ||
+        Array.isArray(data) ||
+        Object.keys(data).some(field => field !== "health") ||
+        typeof data.health !== "number" ||
+        !Number.isFinite(data.health) ||
+        data.health < 0 ||
+        data.health > definition.health
+    ) {
+        throw new Error(`Dados persistentes inválidos para o mob: ${type}.`);
+    }
+
+    return {
+        health: data.health
+    };
+}
+
+
+function captureMobWorldEntityCreatePayload(mob) {
+    if (
+        !mob ||
+        typeof mob.type !== "string" ||
+        !Eg[mob.type] ||
+        !mob.body ||
+        !mob.body.pos ||
+        !mob.body.vel
+    ) {
+        throw new Error("Instância de mob inválida para persistência.");
+    }
+
+    const position = mob.body.pos;
+    const velocity = mob.body.vel;
+    const yaw = mob.yaw;
+
+    const transformValues = [
+        position.x,
+        position.y,
+        position.z,
+        yaw,
+        velocity.x,
+        velocity.y,
+        velocity.z
+    ];
+
+    if (
+        !transformValues.every(Number.isFinite) ||
+        Math.abs(position.x) > 100000 ||
+        position.y < 0 ||
+        position.y >= Wt ||
+        Math.abs(position.z) > 100000 ||
+        Math.abs(yaw) > 1000000 ||
+        Math.abs(velocity.x) > 1000 ||
+        Math.abs(velocity.y) > 1000 ||
+        Math.abs(velocity.z) > 1000
+    ) {
+        throw new Error("Transformação do mob fora dos limites de persistência.");
+    }
+
+    return {
+        entityType: mob.type,
+        transform: {
+            position: {
+                x: position.x,
+                y: position.y,
+                z: position.z
+            },
+            yaw,
+            velocity: {
+                x: velocity.x,
+                y: velocity.y,
+                z: velocity.z
+            }
+        },
+        initialData: normalizeMobWorldEntityData(
+            mob.type,
+            { health: mob.health }
+        )
+    };
+}
+
+
 class Tg {
     constructor(t, e) {
         if (this.type = t,
+        this.worldEntityId = null,
+        this.worldEntityWorldId = null,
+        this.worldEntityRevision = 0,
+        this.worldEntityReplica = !1,
         this.yaw = Math.random() * Math.PI * 2,
         this.headYaw = 0,
         this.state = "idle",
@@ -25204,6 +25303,9 @@ class Tg {
                 this.model.parts["legR" + n].rotation.set(0, -s, -.5),
                 this.model.parts["legL" + n].rotation.set(0, s, .5)
             }
+    }
+    toWorldEntityCreatePayload() {
+        return captureMobWorldEntityCreatePayload(this);
     }
     get alive() {
         return this.state !== "dead"
@@ -25408,7 +25510,8 @@ class wg {
     constructor() {
         this.mobs = [],
         this.group = new wn,
-        this.spawnTimer = 0
+        this.spawnTimer = 0,
+        this.worldEntityMobs = new Map
     }
     add(t, e) {
         const n = new Tg(t,e);
@@ -25416,15 +25519,296 @@ class wg {
         this.group.add(n.model.root),
         n
     }
+    applyWorldEntityRecord(mob, entity, data) {
+        mob.body.pos.set(
+            entity.position_x,
+            entity.position_y,
+            entity.position_z
+        );
+        mob.body.vel.set(
+            entity.velocity_x,
+            entity.velocity_y,
+            entity.velocity_z
+        );
+        mob.yaw = entity.yaw;
+        mob.health = data.health;
+        mob.worldEntityId = entity.id;
+        mob.worldEntityWorldId = entity.world_id;
+        mob.worldEntityRevision = entity.revision;
+        mob.worldEntityReplica = !0;
+        mob.model.root.position.copy(mob.body.pos);
+        mob.model.root.rotation.y = mob.yaw;
+        return mob;
+    }
+    upsertWorldEntity(entity, expectedWorldId) {
+        if (
+            !entity ||
+            typeof entity !== "object" ||
+            typeof expectedWorldId !== "string"
+        ) {
+            throw new Error("Registro de mob persistente inválido.");
+        }
+
+        const type = entity.entity_type;
+
+        // A ponte 4.6.3 trata apenas os quatro animais passivos registrados
+        // na 4.6.2. Outros tipos continuam sob responsabilidade de seus adaptadores.
+        if (!MOB_WORLD_ENTITY_TYPES.has(type)) {
+            return null;
+        }
+
+        const id = typeof entity.id === "string"
+            ? entity.id.toLowerCase()
+            : "";
+        const worldId = typeof entity.world_id === "string"
+            ? entity.world_id.toLowerCase()
+            : "";
+        const revision = Number(entity.revision);
+        const position = [
+            Number(entity.position_x),
+            Number(entity.position_y),
+            Number(entity.position_z)
+        ];
+        const velocity = [
+            Number(entity.velocity_x),
+            Number(entity.velocity_y),
+            Number(entity.velocity_z)
+        ];
+        const yaw = Number(entity.yaw);
+
+        if (
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ||
+            worldId !== expectedWorldId.toLowerCase() ||
+            !Number.isSafeInteger(revision) ||
+            revision < 1 ||
+            !position.every(Number.isFinite) ||
+            !velocity.every(Number.isFinite) ||
+            !Number.isFinite(yaw)
+        ) {
+            throw new Error("Transformação ou identidade do mob persistente inválida.");
+        }
+
+        const data = normalizeMobWorldEntityData(
+            type,
+            entity.data,
+            Number(entity.data_version)
+        );
+        const current = this.worldEntityMobs.get(id);
+
+        if (current) {
+            if (current.worldEntityWorldId !== worldId) {
+                throw new Error("A identidade do mob pertence a outro mundo.");
+            }
+
+            if (revision <= current.worldEntityRevision) {
+                return current;
+            }
+        }
+
+        // health = 0 continua válido no contrato v1, mas não representa uma
+        // criatura viva renderizável. O registro será removido pelo fluxo
+        // autoritativo de morte das próximas etapas.
+        if (data.health === 0) {
+            if (current) {
+                this.removeWorldEntity(id, worldId);
+            }
+            return null;
+        }
+
+        if (current) {
+            return this.applyWorldEntityRecord(current, {
+                ...entity,
+                id,
+                world_id: worldId,
+                revision,
+                yaw,
+                position_x: position[0],
+                position_y: position[1],
+                position_z: position[2],
+                velocity_x: velocity[0],
+                velocity_y: velocity[1],
+                velocity_z: velocity[2]
+            }, data);
+        }
+
+        const mob = this.add(
+            type,
+            new I(position[0], position[1], position[2])
+        );
+
+        this.applyWorldEntityRecord(mob, {
+            ...entity,
+            id,
+            world_id: worldId,
+            revision,
+            yaw,
+            position_x: position[0],
+            position_y: position[1],
+            position_z: position[2],
+            velocity_x: velocity[0],
+            velocity_y: velocity[1],
+            velocity_z: velocity[2]
+        }, data);
+
+        this.worldEntityMobs.set(id, mob);
+        return mob;
+    }
+    applyWorldEntityMovement(update, expectedWorldId) {
+        if (
+            !update ||
+            typeof update !== "object" ||
+            typeof update.id !== "string" ||
+            typeof expectedWorldId !== "string"
+        ) {
+            return false;
+        }
+
+        const id = update.id.toLowerCase();
+        const worldId = expectedWorldId.toLowerCase();
+        const mob = this.worldEntityMobs.get(id);
+        const revision = Number(update.revision);
+
+        if (
+            !mob ||
+            mob.worldEntityWorldId !== worldId ||
+            mob.worldEntityRevision !== revision ||
+            !MOB_WORLD_ENTITY_TYPES.has(mob.type)
+        ) {
+            return false;
+        }
+
+        const position = update.position;
+        const velocity = update.velocity;
+        const yaw = update.yaw;
+
+        if (
+            !position ||
+            !velocity ||
+            ![position.x, position.y, position.z, yaw,
+                velocity.x, velocity.y, velocity.z].every(Number.isFinite) ||
+            Math.abs(position.x) > 100000 ||
+            position.y < 0 ||
+            position.y >= Wt ||
+            Math.abs(position.z) > 100000 ||
+            Math.abs(yaw) > 1000000 ||
+            Math.abs(velocity.x) > 1000 ||
+            Math.abs(velocity.y) > 1000 ||
+            Math.abs(velocity.z) > 1000
+        ) {
+            return false;
+        }
+
+        mob.body.pos.set(position.x, position.y, position.z);
+        mob.body.vel.set(velocity.x, velocity.y, velocity.z);
+        mob.yaw = yaw;
+        mob.model.root.rotation.y = yaw;
+        this.place(mob);
+        return true;
+    }
+    collectWorldEntityMovements(expectedWorldId) {
+        if (typeof expectedWorldId !== "string") {
+            return [];
+        }
+
+        const worldId = expectedWorldId.toLowerCase();
+        const updates = [];
+
+        for (const mob of this.worldEntityMobs.values()) {
+            if (
+                mob.worldEntityWorldId !== worldId ||
+                !mob.worldEntityId ||
+                !MOB_WORLD_ENTITY_TYPES.has(mob.type) ||
+                !mob.alive ||
+                mob.removed
+            ) {
+                continue;
+            }
+
+            updates.push({
+                id: mob.worldEntityId,
+                revision: mob.worldEntityRevision,
+                position: {
+                    x: mob.body.pos.x,
+                    y: mob.body.pos.y,
+                    z: mob.body.pos.z
+                },
+                yaw: mob.yaw,
+                velocity: {
+                    x: mob.body.vel.x,
+                    y: mob.body.vel.y,
+                    z: mob.body.vel.z
+                }
+            });
+        }
+
+        return updates;
+    }
+    syncWorldEntities(entities, expectedWorldId) {
+        if (!Array.isArray(entities) || typeof expectedWorldId !== "string") {
+            throw new Error("Lista de World Entities incompatível com o adaptador de mobs.");
+        }
+
+        const worldId = expectedWorldId.toLowerCase();
+        const seen = new Set;
+
+        for (const entity of entities) {
+            if (!entity || !MOB_WORLD_ENTITY_TYPES.has(entity.entity_type)) {
+                continue;
+            }
+
+            const mob = this.upsertWorldEntity(entity, worldId);
+
+            if (mob?.worldEntityId) {
+                seen.add(mob.worldEntityId);
+            }
+        }
+
+        for (const [entityId, mob] of this.worldEntityMobs) {
+            if (
+                mob.worldEntityWorldId === worldId &&
+                !seen.has(entityId)
+            ) {
+                this.removeWorldEntity(entityId, worldId);
+            }
+        }
+
+        return this.worldEntityMobs.size;
+    }
+    removeWorldEntity(entityId, expectedWorldId) {
+        const id = typeof entityId === "string"
+            ? entityId.toLowerCase()
+            : "";
+        const worldId = typeof expectedWorldId === "string"
+            ? expectedWorldId.toLowerCase()
+            : "";
+        const mob = this.worldEntityMobs.get(id);
+
+        if (
+            !mob ||
+            !worldId ||
+            mob.worldEntityWorldId !== worldId
+        ) {
+            return false;
+        }
+
+        // Remoção persistente não representa morte: não gera drops, partículas
+        // ou qualquer efeito de gameplay local.
+        this.group.remove(mob.model.root);
+        mob.removed = !0;
+        this.mobs = this.mobs.filter(current => current !== mob);
+        this.worldEntityMobs.delete(id);
+        return true;
+    }
     clear() {
         for (const t of this.mobs)
             this.group.remove(t.model.root);
-        this.mobs = []
+        this.mobs = [];
+        this.worldEntityMobs.clear();
     }
     raycast(t, e, n) {
         let s = null;
         for (const r of this.mobs) {
-            if (!r.alive)
+            if (!r.alive || r.worldEntityReplica)
                 continue;
             const o = r.body.pos
               , a = r.def.hw + .1
@@ -25441,7 +25825,7 @@ class wg {
         return s
     }
     damage(t, e, n, s, r=1) {
-        if (!t.alive || t.hurtTime > .35)
+        if (!t.alive || t.worldEntityReplica || t.hurtTime > .35)
             return;
         t.health -= e,
         t.hurtTime = .5;
@@ -25458,21 +25842,46 @@ class wg {
         t.deathTime = 0,
         t.fuse = 0)
     }
-    update(t, e) {
-        for (const n of this.mobs)
-            this.updateMob(n, t, e);
+    update(t, e, spawnMode, simulatePersistentAnimals = false) {
+        for (const n of this.mobs) {
+            const simulatePersistentAnimal =
+                simulatePersistentAnimals &&
+                n.worldEntityReplica &&
+                !!n.worldEntityId &&
+                MOB_WORLD_ENTITY_TYPES.has(n.type);
+
+            if (n.worldEntityReplica && !simulatePersistentAnimal) {
+                this.place(n);
+            } else {
+                this.updateMob(n, t, e);
+            }
+        }
         for (const n of this.mobs)
             n.removed && this.group.remove(n.model.root);
-        this.mobs = this.mobs.filter(n => !n.removed),
-        this.spawnTimer -= t,
-        this.spawnTimer <= 0 && (this.spawnTimer = 1,
-        this.trySpawn(e))
+        this.mobs = this.mobs.filter(n => !n.removed);
+
+        if (spawnMode === undefined) {
+            this.spawnTimer -= t;
+            if (this.spawnTimer <= 0) {
+                this.spawnTimer = 1;
+                this.trySpawn(e);
+            }
+        } else if (typeof spawnMode === "function") {
+            this.spawnTimer -= t;
+            if (this.spawnTimer <= 0) {
+                this.spawnTimer = 30;
+                this.trySpawn(e, 1, spawnMode);
+            }
+        } else {
+            // Mundos compartilhados sem autoridade local não geram mobs locais.
+            this.spawnTimer = Math.max(0, this.spawnTimer - t);
+        }
     }
     lightAt(t, e, n) {
         const [s,r] = t.getLight(Math.floor(e.x), Math.floor(e.y + .5), Math.floor(e.z));
         return Math.max(s - Math.round((1 - n) * 11), r)
     }
-    trySpawn(t, e=1) {
+    trySpawn(t, e=1, onPersistentAnimalSpawn=null) {
         const {world: n, playerPos: s} = t;
         let r = 0
           , o = 0;
@@ -25491,16 +25900,55 @@ class wg {
                         const y = ["cow", "pig", "sheep", "chicken"]
                           , T = y[Math.floor(Math.random() * y.length)]
                           , U = 2 + Math.floor(Math.random() * 3);
-                        for (let k = 0; k < U; k++) {
-                            const G = L + Math.floor(Math.random() * 5) - 2
-                              , P = A + Math.floor(Math.random() * 5) - 2
-                              , O = n.surfaceY(G, P);
-                            O > 0 && n.getBlock(G, O, P) === M.GRASS && !xh(n, G + .5 - .45, O + 1, P + .5 - .45, G + .95, O + 2.4, P + .95) && (this.add(T, new I(G + .5,O + 1,P + .5)),
-                            r++)
+
+                        if (onPersistentAnimalSpawn) {
+                            const candidates = [];
+
+                            for (let k = 0; k < U; k++) {
+                                const G = L + Math.floor(Math.random() * 5) - 2
+                                  , P = A + Math.floor(Math.random() * 5) - 2
+                                  , O = n.surfaceY(G, P);
+
+                                if (
+                                    O > 0 &&
+                                    n.getBlock(G, O, P) === M.GRASS &&
+                                    !xh(n, G + .5 - .45, O + 1, P + .5 - .45, G + .95, O + 2.4, P + .95)
+                                ) {
+                                    candidates.push({
+                                        entityType: T,
+                                        position: {
+                                            x: G + .5,
+                                            y: O + 1,
+                                            z: P + .5
+                                        },
+                                        yaw: Math.random() * Math.PI * 2
+                                    });
+                                }
+                            }
+
+                            if (candidates.length > 0) {
+                                onPersistentAnimalSpawn(candidates);
+                                return;
+                            }
+                        } else {
+                            for (let k = 0; k < U; k++) {
+                                const G = L + Math.floor(Math.random() * 5) - 2
+                                  , P = A + Math.floor(Math.random() * 5) - 2
+                                  , O = n.surfaceY(G, P);
+                                O > 0 && n.getBlock(G, O, P) === M.GRASS && !xh(n, G + .5 - .45, O + 1, P + .5 - .45, G + .95, O + 2.4, P + .95) && (this.add(T, new I(G + .5,O + 1,P + .5)),
+                                r++)
+                            }
                         }
                     }
                 }
             }
+
+            // Em mundos compartilhados, o callback persiste somente animais.
+            // Os hostis serão integrados à autoridade multiplayer na 4.6.7.
+            if (onPersistentAnimalSpawn) {
+                continue;
+            }
+
             if (t.difficulty === 0)
                 continue;
             const l = [0, 5, 10, 16][t.difficulty];
@@ -25535,7 +25983,10 @@ class wg {
           , a = Lo.copy(n.playerPos).sub(o)
           , l = a.length();
         if (!s.isLoaded(o.x, o.z)) {
-            l > 160 && (t.removed = !0);
+            // Chunk descarregado não significa morte ou remoção persistente.
+            if (!t.worldEntityId && l > 160) {
+                t.removed = !0;
+            }
             return
         }
         if (r.hostile && (l > 80 || n.difficulty === 0)) {
@@ -25543,7 +25994,11 @@ class wg {
             return
         }
         if (!r.hostile && l > 120) {
-            t.removed = !0;
+            // Animais persistentes ficam inativos fora do raio de simulação,
+            // mas permanecem registrados para retomarem quando o jogador voltar.
+            if (!t.worldEntityId) {
+                t.removed = !0;
+            }
             return
         }
         if (t.hurtTime = Math.max(0, t.hurtTime - e),
@@ -25747,7 +26202,7 @@ class wg {
         return this.mobs.filter(e => e.alive && e.def.hostile === t).length
     }
     toJSON() {
-        return this.mobs.filter(t => t.alive && !t.def.hostile).map(t => ({
+        return this.mobs.filter(t => t.alive && !t.def.hostile && !t.worldEntityId).map(t => ({
             t: t.type,
             x: t.body.pos.x,
             y: t.body.pos.y,
@@ -28042,6 +28497,10 @@ class zg {
         this.multiplayerRoomCode = null;
         this.multiplayerJoining = false;
         this.multiplayerMoveTimer = 0;
+        this.sharedAnimalSpawnPendingWorldId = null;
+        this.sharedAnimalMoveTimer = 0;
+        this.sharedAnimalCheckpointTimer = 0;
+        this.sharedAnimalCheckpointPendingWorldId = null;
 
         this.pendingBlockChanges = [];
         this.blockChangeFlushTimer = null;
@@ -28504,6 +28963,11 @@ class zg {
             payload => this.removeRemoteWorldEntity(payload)
         );
 
+        this.multiplayerSocket.on(
+            "world:animals:moved",
+            payload => this.applyRemoteWorldAnimalMovement(payload)
+        );
+
     }
 async ensureMultiplayerConnected() {
     if (!this.multiplayerToken || !this.multiplayerUser) {
@@ -28629,10 +29093,20 @@ applyRemoteWorldEntity(payload) {
     }
 
     try {
-        return this.worldEntities.upsert(
+        const accepted = this.worldEntities.upsert(
             payload.entity,
             payload.worldId
         );
+
+        if (accepted) {
+            const entity = this.worldEntities.get(payload.entity.id);
+
+            if (entity) {
+                this.mobs.upsertWorldEntity(entity, payload.worldId);
+            }
+        }
+
+        return accepted;
     } catch (error) {
         console.warn("World Entity recebida foi rejeitada:", error.message);
         return false;
@@ -28650,10 +29124,56 @@ removeRemoteWorldEntity(payload) {
         return false;
     }
 
-    return this.worldEntities.remove(
+    const removed = this.worldEntities.remove(
         payload,
         this.meta.id
     );
+
+    if (removed) {
+        this.mobs.removeWorldEntity(
+            payload.entityId,
+            this.meta.id
+        );
+    }
+
+    return removed;
+}
+
+
+applyRemoteWorldAnimalMovement(payload) {
+    if (
+        !payload ||
+        payload.worldId !== this.multiplayerWorldId ||
+        !this.meta ||
+        this.meta.storage !== "shared" ||
+        this.meta.id !== this.multiplayerWorldId ||
+        !Array.isArray(payload.animals) ||
+        payload.animals.length > 10
+    ) {
+        return false;
+    }
+
+    let applied = 0;
+
+    for (const update of payload.animals) {
+        const entity = this.worldEntities.get(
+            typeof update?.id === "string" ? update.id.toLowerCase() : ""
+        );
+
+        if (
+            !entity ||
+            !MOB_WORLD_ENTITY_TYPES.has(entity.entity_type) ||
+            Number(update.revision) !== entity.revision
+        ) {
+            continue;
+        }
+
+        if (this.mobs.applyWorldEntityMovement(update, this.meta.id)) {
+            applied++;
+        }
+    }
+
+    return applied;
 }
 
 
@@ -28687,7 +29207,9 @@ async createWorldEntity(entityType, transform, initialData = undefined) {
         throw new Error("O servidor retornou uma entidade inválida ou desatualizada.");
     }
 
-    return this.worldEntities.get(response.entity.id);
+    const entity = this.worldEntities.get(response.entity.id);
+    this.mobs.upsertWorldEntity(entity, worldId);
+    return entity;
 }
 
 
@@ -28717,7 +29239,13 @@ async listWorldEntities(options = {}) {
     }
 
     for (const entity of response.entities) {
-        this.worldEntities.upsert(entity, worldId);
+        if (this.worldEntities.upsert(entity, worldId)) {
+            const current = this.worldEntities.get(entity.id);
+
+            if (current) {
+                this.mobs.upsertWorldEntity(current, worldId);
+            }
+        }
     }
 
     return {
@@ -28777,10 +29305,13 @@ async updateWorldEntity(entityId, changes = {}) {
             throw new Error("A resposta de atualização da entidade é inválida.");
         }
 
+        this.mobs.upsertWorldEntity(latest, worldId);
         return latest;
     }
 
-    return this.worldEntities.get(entityId);
+    const updated = this.worldEntities.get(entityId);
+    this.mobs.upsertWorldEntity(updated, worldId);
+    return updated;
 }
 
 
@@ -28809,7 +29340,10 @@ async removeWorldEntity(entityId, expectedRevision = undefined) {
         }
     );
 
-    this.worldEntities.remove(response, worldId);
+    if (this.worldEntities.remove(response, worldId)) {
+        this.mobs.removeWorldEntity(entityId, worldId);
+    }
+
     return response;
 }
 
@@ -29243,9 +29777,298 @@ async loadSharedWorld(worldId) {
                 );
 
                 this.ui.toast("Multiplayer conectado!");
+
+                // Publica a posição restaurada antes do primeiro spawn,
+                // pois o servidor valida a distância em relação ao jogador.
+                this.multiplayerMoveTimer = 0.05;
+                this.updateMultiplayerMovement(0);
+                this.trySpawnSharedAnimals(30);
+
                 void this.flushSharedBlockChanges();
             }
         );
+    }
+
+    isWorldAnimalSpawnAuthority() {
+        if (
+            !this.meta ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== this.meta.id ||
+            !this.multiplayerUser?.id
+        ) {
+            return false;
+        }
+
+        const onlineIds = [
+            this.multiplayerUser.id,
+            ...this.remotePlayers.keys()
+        ].filter(id => typeof id === "string");
+        const ownerId = this.meta.ownerId;
+        const authorityId = ownerId && onlineIds.includes(ownerId)
+            ? ownerId
+            : onlineIds.sort()[0] ?? null;
+
+        return authorityId === this.multiplayerUser.id;
+    }
+
+    collectSharedAnimalCheckpointBatch() {
+        if (!this.meta?.id) {
+            return [];
+        }
+
+        const worldId = this.meta.id;
+        const updates = [];
+
+        for (const entity of this.worldEntities.values()) {
+            if (!MOB_WORLD_ENTITY_TYPES.has(entity.entity_type)) {
+                continue;
+            }
+
+            const mob = this.mobs.worldEntityMobs.get(entity.id);
+
+            if (
+                !mob ||
+                !mob.alive ||
+                mob.removed ||
+                mob.worldEntityWorldId !== worldId ||
+                mob.worldEntityRevision !== entity.revision
+            ) {
+                continue;
+            }
+
+            const positionChanged =
+                Math.abs(mob.body.pos.x - entity.position_x) > 0.1 ||
+                Math.abs(mob.body.pos.y - entity.position_y) > 0.1 ||
+                Math.abs(mob.body.pos.z - entity.position_z) > 0.1;
+            const rotationChanged = Math.abs(mob.yaw - entity.yaw) > 0.05;
+            const velocityChanged =
+                Math.abs(mob.body.vel.x - entity.velocity_x) > 0.25 ||
+                Math.abs(mob.body.vel.y - entity.velocity_y) > 0.25 ||
+                Math.abs(mob.body.vel.z - entity.velocity_z) > 0.25;
+
+            if (!positionChanged && !rotationChanged && !velocityChanged) {
+                continue;
+            }
+
+            updates.push({
+                id: entity.id,
+                expectedRevision: entity.revision,
+                transform: {
+                    position: {
+                        x: mob.body.pos.x,
+                        y: mob.body.pos.y,
+                        z: mob.body.pos.z
+                    },
+                    yaw: mob.yaw,
+                    velocity: {
+                        x: mob.body.vel.x,
+                        y: mob.body.vel.y,
+                        z: mob.body.vel.z
+                    }
+                }
+            });
+        }
+
+        return updates.slice(0, 10);
+    }
+
+    updateSharedAnimalSynchronization(delta) {
+        const worldId = this.meta?.id;
+
+        if (
+            !worldId ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId ||
+            !this.multiplayerSocket?.connected ||
+            !this.isWorldAnimalSpawnAuthority()
+        ) {
+            this.sharedAnimalMoveTimer = 0;
+            this.sharedAnimalCheckpointTimer = 0;
+            return;
+        }
+
+        this.sharedAnimalMoveTimer += Math.max(0, delta);
+        this.sharedAnimalCheckpointTimer += Math.max(0, delta);
+
+        if (this.sharedAnimalMoveTimer >= 0.1) {
+            this.sharedAnimalMoveTimer = 0;
+
+            const animals = this.mobs.collectWorldEntityMovements(worldId);
+
+            if (animals.length > 0) {
+                this.multiplayerSocket.emit("world:animals:move", {
+                    worldId,
+                    animals
+                });
+            }
+        }
+
+        if (
+            this.sharedAnimalCheckpointTimer >= 5 &&
+            this.sharedAnimalCheckpointPendingWorldId !== worldId
+        ) {
+            this.sharedAnimalCheckpointTimer = 0;
+            void this.requestSharedAnimalCheckpoint();
+        }
+    }
+
+    async requestSharedAnimalCheckpoint() {
+        const worldId = this.meta?.id;
+
+        if (
+            !worldId ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId ||
+            !this.isWorldAnimalSpawnAuthority() ||
+            this.sharedAnimalCheckpointPendingWorldId === worldId
+        ) {
+            return false;
+        }
+
+        const animals = this.collectSharedAnimalCheckpointBatch();
+
+        if (animals.length === 0) {
+            return 0;
+        }
+
+        this.sharedAnimalCheckpointPendingWorldId = worldId;
+
+        try {
+            const response = await this.requestWorldEvent(
+                "world:animals:checkpoint",
+                {
+                    worldId,
+                    animals
+                }
+            );
+
+            if (
+                this.meta?.id !== worldId ||
+                this.multiplayerWorldId !== worldId ||
+                !Array.isArray(response.entities)
+            ) {
+                return false;
+            }
+
+            for (const entity of response.entities) {
+                this.worldEntities.upsert(entity, worldId);
+                const current = this.worldEntities.get(entity.id);
+
+                if (current) {
+                    this.mobs.upsertWorldEntity(current, worldId);
+                }
+            }
+
+            return response.entities.length;
+
+        } catch (error) {
+            if (error.code === "REVISION_CONFLICT" && error.currentEntity) {
+                this.worldEntities.upsert(error.currentEntity, worldId);
+                const current = this.worldEntities.get(error.currentEntity.id);
+
+                if (current) {
+                    this.mobs.upsertWorldEntity(current, worldId);
+                }
+            }
+
+            if (
+                error.code !== "WORLD_ENTITY_SPAWN_AUTHORITY" &&
+                error.code !== "REVISION_CONFLICT" &&
+                error.code !== "ANIMAL_CHECKPOINT_PENDING"
+            ) {
+                console.warn(
+                    "Não foi possível persistir o movimento dos animais:",
+                    error.message
+                );
+            }
+
+            return false;
+
+        } finally {
+            if (this.sharedAnimalCheckpointPendingWorldId === worldId) {
+                this.sharedAnimalCheckpointPendingWorldId = null;
+            }
+        }
+    }
+
+    trySpawnSharedAnimals(attempts = 30) {
+        if (!this.isWorldAnimalSpawnAuthority()) {
+            return false;
+        }
+
+        this.mobs.spawnTimer = 30;
+        this.mobs.trySpawn(
+            this.mobCtx,
+            attempts,
+            candidates => void this.requestSharedAnimalSpawn(candidates)
+        );
+        return true;
+    }
+
+    async requestSharedAnimalSpawn(candidates) {
+        const worldId = this.meta?.id;
+
+        if (
+            !worldId ||
+            this.meta.storage !== "shared" ||
+            this.multiplayerWorldId !== worldId ||
+            !this.isWorldAnimalSpawnAuthority() ||
+            this.sharedAnimalSpawnPendingWorldId === worldId ||
+            !Array.isArray(candidates) ||
+            candidates.length < 1 ||
+            candidates.length > 4
+        ) {
+            return false;
+        }
+
+        this.sharedAnimalSpawnPendingWorldId = worldId;
+
+        try {
+            const response = await this.requestWorldEvent(
+                "world:animals:spawn",
+                {
+                    worldId,
+                    animals: candidates
+                }
+            );
+
+            if (
+                this.meta?.id !== worldId ||
+                this.multiplayerWorldId !== worldId ||
+                !Array.isArray(response.entities)
+            ) {
+                return false;
+            }
+
+            for (const entity of response.entities) {
+                if (this.worldEntities.upsert(entity, worldId)) {
+                    const current = this.worldEntities.get(entity.id);
+                    if (current) {
+                        this.mobs.upsertWorldEntity(current, worldId);
+                    }
+                }
+            }
+
+            return response.entities.length;
+
+        } catch (error) {
+            if (
+                error.code !== "WORLD_ENTITY_SPAWN_AUTHORITY" &&
+                error.code !== "ANIMAL_SPAWN_COOLDOWN"
+            ) {
+                console.warn(
+                    "Não foi possível gerar animais persistentes:",
+                    error.message
+                );
+            }
+
+            return false;
+
+        } finally {
+            if (this.sharedAnimalSpawnPendingWorldId === worldId) {
+                this.sharedAnimalSpawnPendingWorldId = null;
+            }
+        }
     }
 
     updateRemotePlayer(data) {
@@ -29556,6 +30379,10 @@ async loadSharedWorld(worldId) {
         this.multiplayerWorldId = null;
         this.multiplayerJoining = false;
         this.multiplayerMoveTimer = 0;
+        this.sharedAnimalSpawnPendingWorldId = null;
+        this.sharedAnimalMoveTimer = 0;
+        this.sharedAnimalCheckpointTimer = 0;
+        this.sharedAnimalCheckpointPendingWorldId = null;
 
         this.clearRemotePlayers();
         this.worldEntities.clear();
@@ -29687,6 +30514,10 @@ async loadSharedWorld(worldId) {
         this.difficulty = t.difficulty;
         this.worldEntities.load(
             e?.worldEntities ?? [],
+            t.id
+        );
+        this.mobs.syncWorldEntities(
+            [...this.worldEntities.values()],
             t.id
         );
         const n = new Map;
@@ -29931,7 +30762,7 @@ async loadSharedWorld(worldId) {
         let n = 0;
         for (; xh(this.world, e.pos.x - .3, e.pos.y, e.pos.z - .3, e.pos.x + .3, e.pos.y + 1.8, e.pos.z + .3) && n++ < 128; )
             e.pos.y += 1;
-        this.mobs.trySpawn(this.mobCtx, 30),
+        this.meta?.storage !== "shared" && this.mobs.trySpawn(this.mobCtx, 30),
         this.state = "playing",
         this.ui.setHudVisible(!this.hudHidden),
         this.ui.showResumeHint(),
@@ -30324,7 +31155,18 @@ async loadSharedWorld(worldId) {
         this.mobCtx.daylight = this.sky.state.daylight,
         this.mobCtx.playerPos.copy(n.body.pos),
         this.mobCtx.playerEye.copy(n.eye),
-        this.mobs.update(t, this.mobCtx),
+        this.mobs.update(
+            t,
+            this.mobCtx,
+            this.meta?.storage === "shared"
+                ? (this.isWorldAnimalSpawnAuthority()
+                    ? candidates => void this.requestSharedAnimalSpawn(candidates)
+                    : null)
+                : undefined,
+            this.meta?.storage === "shared" &&
+                this.isWorldAnimalSpawnAuthority()
+        ),
+        this.updateSharedAnimalSynchronization(t),
         this.entities.update(t, e, n.body.pos, h => this.pickup(h), h => this.arrowHitsPlayer(h), 1),
         this.particles.update(t, e),
         this.sleepT >= 0 && (this.sleepT += t,
